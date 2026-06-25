@@ -13,9 +13,27 @@
 #include <linux/bio.h>
 #include <linux/device-mapper.h>
 #include <linux/hashtable.h>
+#include <linux/spinlock.h>
+#include <linux/blkzoned.h>
 
 #define DM_MSG_PREFIX "zns-m1"
 #define MAP_HASH_BITS   15      // 해시 테이블 크기
+
+// Zone 하나의 상태
+struct zone_state {
+    sector_t    wp;         // 현재 write pointer
+    sector_t    capacity;   // zone 용량 (sectors)
+    bool        is_active;  // 현재 쓰기 대상 zone인지
+    bool        is_full;    // wp == capacity
+};
+
+// Mapping Table 엔트리 하나
+struct map_entry {
+    sector_t        logical_sector;   // 키: ext4가 요청한 LBA
+    u32             zone_idx;         // 값: 물리 zone 번호
+    sector_t        zone_offset;      // 값: zone 내 sector 오프셋
+    struct hlist_node node;
+};
 
 struct zns_m1_c {
     struct dm_dev *dev;
@@ -113,6 +131,18 @@ static void zns_m1_dtr(struct dm_target *ti)
 {
     struct zns_m1_c *c = ti->private;
 
+    struct map_entry *e;
+    struct hlist_node *tmp;
+    unsigned int bkt;
+
+    // 매핑 테이블 해제
+    hash_for_each_safe(c->map, bkt, tmp, e, node) {
+        hash_del(&e->node);
+        kfree(e);
+    }
+
+    kfree(c->zones);
+
     dm_put_device(ti, c->dev);
     kfree(c);
     DMINFO("dtr: target detached");
@@ -154,8 +184,8 @@ static int zns_m1_iterate_devices(struct dm_target *ti,
 
 static struct target_type zns_m1_target = {
     .name            = "zns-m1",
-    .version         = {1, 0, 0},       // DM_TARGET_ZONED_HM 제거
-    .features        = DM_TARGET_ZONED_HM,
+    .version         = {0, 1, 0},
+    .features        = 0,               // DM_TARGET_ZONED_HM 제거
     .module          = THIS_MODULE,
     .ctr             = zns_m1_ctr,
     .dtr             = zns_m1_dtr,
