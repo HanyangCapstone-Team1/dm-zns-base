@@ -15,6 +15,7 @@
 #include <linux/hashtable.h>
 #include <linux/spinlock.h>
 #include <linux/blkzoned.h>
+#include <linux/slab.h>
 
 #define DM_MSG_PREFIX "zns-m1"
 #define MAP_HASH_BITS   15      // 해시 테이블 크기
@@ -49,6 +50,69 @@ struct zns_m1_c {
     spinlock_t          lock;
 };
 
+// logical_sector에 해당하는 엔트리 반환, 없으면 NULL 반환
+static struct map_entry *map_lookup(struct zns_m1_c *c, sector_t logical_sector)
+{
+    struct map_entry *e;
+
+    hash_for_each_possible(c->map, e, node, (u32)logical_sector) {
+        if (e->logical_sector == logical_sector)
+            return e;
+    }
+    return NULL;
+}
+
+// 매핑 삽입 (성공: 0, 실패: -ENOMEM)
+static int map_insert(struct zns_m1_c *c, sector_t logical, u32 zone_idx, sector_t zone_offset)
+{
+    struct map_entry *e = map_lookup(c, logical);
+
+    if (!e) {
+        e = kmalloc(sizeof(*e), GFP_ATOMIC);
+        if (!e)
+            return -ENOMEM;
+        e->logical_sector = logical;
+        hash_add(c->map, &e->node, (u32)logical);
+    }
+    // 기존 엔트리가 있으면 overwrite 처리
+    e->zone_idx    = zone_idx;
+    e->zone_offset = zone_offset;
+    return 0;
+}
+
+// 다음 빈 zone을 찾아 active_zone으로 설정 (성공: 0, 빈 zone 없음: -ENOSPC)
+static int advance_active_zone(struct zns_m1_c *c)
+{
+    u32 i;
+
+    for (i = 0; i < c->nr_zones; i++) {
+        if (!c->zones[i].is_full && !c->zones[i].is_active &&
+            c->zones[i].wp == 0) {
+            c->zones[c->active_zone].is_active = false;
+            c->active_zone = i;
+            c->zones[i].is_active = true;
+            DMINFO("active zone → %u", i);
+            return 0;
+        }
+    }
+    return -ENOSPC;
+}
+
+// 각 zone 정보를 zone_state 배열에 채움
+static int fill_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
+{
+    struct zns_m1_c *c = data;
+
+    if (idx >= c->nr_zones)
+        return -ERANGE;
+
+    c->zones[idx].capacity  = zone->capacity; /* sectors */
+    c->zones[idx].wp        = zone->wp - zone->start; /* zone-relative */
+    c->zones[idx].is_full   = (zone->cond == BLK_ZONE_COND_FULL);
+    c->zones[idx].is_active = false;
+    return 0;
+}
+
 static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
     struct zns_m1_c *c;
@@ -68,8 +132,10 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
         return -ENOMEM;
     }
 
-    ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
-                &c->dev);
+    spin_lock_init(&c->lock);
+    hash_init(c->map);
+
+    ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &c->dev);
     if (ret) {
         ti->error = "failed to open underlying device";
         kfree(c);
@@ -116,7 +182,7 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     ti->num_flush_bios = 1;
     ti->num_discard_bios = 1;
 
-    DMINFO("ctr: target attached on top of '%s'", argv[0]);
+    DMINFO("ctr: target attached on top of '%s'", c->nr_zones, (unsigned long long)c->zone_size, argv[0]);
     return 0;
 
 err_zones:
@@ -152,11 +218,74 @@ static int zns_m1_map(struct dm_target *ti, struct bio *bio)
 {
     struct zns_m1_c *c = ti->private;
 
-    /* Student work goes here: translate random writes into sequential ones. */
+    sector_t logical_sector = bio->bi_iter.bi_sector;
+    sector_t nr_sectors      = bio_sectors(bio);
+    unsigned long flags;
+    int ret = DM_MAPIO_REMAPPED;
 
+    // FLUSH/DISCARD는 그대로 통과
+    if (bio->bi_opf & REQ_PREFLUSH || bio_op(bio) == REQ_OP_DISCARD) {
+        bio_set_dev(bio, c->dev->bdev);
+        return DM_MAPIO_REMAPPED;
+    }
 
-    bio_set_dev(bio, c->dev->bdev);
-    return DM_MAPIO_REMAPPED;
+    spin_lock_irqsave(&c->lock, flags);
+
+    // 읽기 경로
+    if (bio_data_dir(bio) == READ) {
+        struct map_entry *e = map_lookup(c, logical_sector);
+        if (!e) {
+            // 아직 한 번도 쓰지 않은 LBA를 읽는 경우.
+            // zero-fill로 응답
+            spin_unlock_irqrestore(&c->lock, flags);
+            zero_fill_bio(bio);
+            bio_endio(bio);
+            return DM_MAPIO_SUBMITTED;
+        }
+
+        // 물리 주소로 재작성
+        bio_set_dev(bio, c->dev->bdev);
+        bio->bi_iter.bi_sector = ti->begin + (sector_t)e->zone_idx * c->zone_size + e->zone_offset;
+
+    }
+    // 쓰기 경로
+    else {
+        struct zone_state *az = &c->zones[c->active_zone];
+
+        // 활성 zone이 꽉 찼으면 다음 zone으로
+        if (az->wp + nr_sectors > az->capacity) {
+            az->is_full = true;
+            if (advance_active_zone(c) < 0) {
+                spin_unlock_irqrestore(&c->lock, flags);
+                DMERR("device full, no free zones");
+                bio->bi_status = BLK_STS_NOSPC;
+                bio_endio(bio);
+                return DM_MAPIO_SUBMITTED;
+            }
+            az = &c->zones[c->active_zone];
+        }
+
+        // 매핑 기록
+        if (map_insert(c, logical_sector, c->active_zone, az->wp) < 0) {
+            spin_unlock_irqrestore(&c->lock, flags);
+            DMERR("map_insert OOM");
+            bio->bi_status = BLK_STS_RESOURCE;
+            bio_endio(bio);
+            return DM_MAPIO_SUBMITTED;
+        }
+
+        // bio를 wp로 재작성
+        bio_set_dev(bio, c->dev->bdev);
+        bio->bi_iter.bi_sector = ti->begin
+                                 + (sector_t)c->active_zone * c->zone_size
+                                 + az->wp;
+
+        // write pointer 전진
+        az->wp += nr_sectors;
+    }
+
+    spin_unlock_irqrestore(&c->lock, flags);
+    return ret;
 }
 
 /* 1:1 mapping, so ti->begin is passed straight through. A non-identity
