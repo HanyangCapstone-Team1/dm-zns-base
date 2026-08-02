@@ -770,13 +770,17 @@ static int zns_m1_map(struct dm_target *ti, struct bio *bio)
 static void zns_m1_io_hints(struct dm_target *ti,
 			    struct queue_limits *limits)
 {
+	unsigned int max_discard = min_t(sector_t, ti->len, UINT_MAX);
+
 	limits->logical_block_size = MAP_BLOCK_SIZE;
 	limits->physical_block_size = MAP_BLOCK_SIZE;
 	limits->io_min = MAP_BLOCK_SIZE;
 	limits->io_opt = MAP_BLOCK_SIZE;
 	limits->discard_granularity = MAP_BLOCK_SIZE;
-	limits->max_hw_discard_sectors =
-		min_t(sector_t, ti->len, UINT_MAX);
+	limits->discard_alignment = 0;
+	limits->max_discard_sectors = max_discard;
+	limits->max_hw_discard_sectors = max_discard;
+	limits->max_discard_segments = 1;
 }
 
 static struct target_type zns_m1_target = {

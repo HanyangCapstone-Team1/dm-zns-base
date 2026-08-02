@@ -83,6 +83,13 @@ if [ "$logical_block_size" -ne 4096 ]; then
 	exit 2
 fi
 
+discard_max_bytes=$(cat "/sys/block/$dm_base/queue/discard_max_bytes")
+echo "[*] $DM_DEV discard_max_bytes=$discard_max_bytes"
+if [ "$discard_max_bytes" -lt 4096 ]; then
+	echo "[FAIL] DM device does not advertise logical discard" >&2
+	exit 2
+fi
+
 before=$(dmesg | grep -Ec 'blk_update_request|I/O error' || true)
 
 echo "[*] Checking logical discard tombstone"
