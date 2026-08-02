@@ -13,16 +13,18 @@
 #include <linux/bio.h>
 #include <linux/device-mapper.h>
 #include <linux/rbtree.h>
-#include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/blkzoned.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
 #define DM_MSG_PREFIX "zns-m1"
-#define MAP_GRANULARITY_SECTORS 1
-#define MEMTABLE_MAX_ENTRIES 4096
+#define MAP_BLOCK_SIZE 4096
+#define MAP_GRANULARITY_SECTORS (MAP_BLOCK_SIZE >> SECTOR_SHIFT)
+#define MEMTABLE_MAX_ENTRIES 1024
 #define RUNS_PER_COMPACTION 4
 #define MAX_LSM_LEVELS 16
+#define CLONE_BIO_POOL_SIZE 128
 
 struct zone_state {
 	sector_t wp;
@@ -36,7 +38,18 @@ struct map_entry {
 	u32 zone_idx;
 	sector_t zone_offset;
 	u64 sequence;
+	bool tombstone;
 	struct rb_node node;
+};
+
+struct zns_m1_c;
+
+struct zns_io_work {
+	struct work_struct work;
+	struct zns_m1_c *ctx;
+	struct dm_target *ti;
+	struct bio *bio;
+	bool is_flush;
 };
 
 struct sorted_run {
@@ -64,7 +77,9 @@ struct zns_m1_c {
 	struct work_struct compaction_work;
 	bool compaction_running;
 	bool stopping;
-	spinlock_t lock;
+	struct workqueue_struct *io_wq;
+	struct bio_set clone_bioset;
+	struct mutex lock;
 };
 
 static struct map_entry *tree_lookup(struct rb_root *root,
@@ -87,8 +102,8 @@ static struct map_entry *tree_lookup(struct rb_root *root,
 }
 
 static int tree_insert(struct rb_root *root, sector_t logical, u32 zone_idx,
-		       sector_t zone_offset, u64 sequence, gfp_t gfp,
-		       bool replace_newer)
+		       sector_t zone_offset, u64 sequence, bool tombstone,
+		       gfp_t gfp, bool replace_newer)
 {
 	struct rb_node **link = &root->rb_node;
 	struct rb_node *parent = NULL;
@@ -107,6 +122,7 @@ static int tree_insert(struct rb_root *root, sector_t logical, u32 zone_idx,
 				e->zone_idx = zone_idx;
 				e->zone_offset = zone_offset;
 				e->sequence = sequence;
+				e->tombstone = tombstone;
 			}
 			return 0;
 		}
@@ -120,6 +136,7 @@ static int tree_insert(struct rb_root *root, sector_t logical, u32 zone_idx,
 	e->zone_idx = zone_idx;
 	e->zone_offset = zone_offset;
 	e->sequence = sequence;
+	e->tombstone = tombstone;
 	rb_link_node(&e->node, parent, link);
 	rb_insert_color(&e->node, root);
 	return 1;
@@ -201,7 +218,7 @@ static void rotate_memtable(struct zns_m1_c *c)
 	if (c->active_entries < MEMTABLE_MAX_ENTRIES)
 		return;
 
-	run = kmalloc(sizeof(*run), GFP_ATOMIC);
+	run = kmalloc(sizeof(*run), GFP_KERNEL);
 	if (!run)
 		return;
 
@@ -222,12 +239,12 @@ static void rotate_memtable(struct zns_m1_c *c)
 }
 
 static int map_insert(struct zns_m1_c *c, sector_t logical, u32 zone_idx,
-		      sector_t zone_offset)
+		      sector_t zone_offset, bool tombstone)
 {
 	int ret;
 
 	ret = tree_insert(&c->active_memtable, logical, zone_idx, zone_offset,
-			  ++c->next_sequence, GFP_ATOMIC, false);
+			  ++c->next_sequence, tombstone, GFP_KERNEL, false);
 	if (ret < 0)
 		return ret;
 	if (ret > 0)
@@ -275,7 +292,8 @@ static int find_initial_active_zone(struct zns_m1_c *c)
 
 	for (i = 0; i < c->nr_zones; i++) {
 		if (!c->zones[i].is_full &&
-		    c->zones[i].wp < c->zones[i].capacity) {
+		    c->zones[i].wp < c->zones[i].capacity &&
+		    IS_ALIGNED(c->zones[i].wp, MAP_GRANULARITY_SECTORS)) {
 			c->active_zone = i;
 			c->zones[i].is_active = true;
 			return 0;
@@ -329,7 +347,6 @@ static void compact_runs(struct work_struct *work)
 	struct zns_m1_c *c = container_of(work, struct zns_m1_c,
 					  compaction_work);
 	struct sorted_run *selected[RUNS_PER_COMPACTION];
-	unsigned long flags;
 
 	while (1) {
 		struct sorted_run *output;
@@ -339,20 +356,20 @@ static void compact_runs(struct work_struct *work)
 		unsigned int i;
 		int ret = 0;
 
-		spin_lock_irqsave(&c->lock, flags);
+		mutex_lock(&c->lock);
 		if (c->stopping) {
 			c->compaction_running = false;
-			spin_unlock_irqrestore(&c->lock, flags);
+			mutex_unlock(&c->lock);
 			return;
 		}
 
 		nr = select_compaction(c, selected, &level);
 		if (!nr) {
 			c->compaction_running = false;
-			spin_unlock_irqrestore(&c->lock, flags);
+			mutex_unlock(&c->lock);
 			return;
 		}
-		spin_unlock_irqrestore(&c->lock, flags);
+		mutex_unlock(&c->lock);
 
 		output = kzalloc(sizeof(*output), GFP_KERNEL);
 		if (!output) {
@@ -377,7 +394,7 @@ static void compact_runs(struct work_struct *work)
 				inserted = tree_insert(&output->root,
 						e->logical_sector, e->zone_idx,
 						e->zone_offset, e->sequence,
-						GFP_KERNEL, true);
+						e->tombstone, GFP_KERNEL, true);
 				if (inserted < 0) {
 					ret = inserted;
 					break;
@@ -393,14 +410,14 @@ static void compact_runs(struct work_struct *work)
 		}
 
 		output->generation = generation;
-		spin_lock_irqsave(&c->lock, flags);
+		mutex_lock(&c->lock);
 		for (i = 0; i < nr; i++) {
 			list_del(&selected[i]->list);
 			c->nr_runs--;
 		}
 		list_add_tail(&output->list, &c->runs);
 		c->nr_runs++;
-		spin_unlock_irqrestore(&c->lock, flags);
+		mutex_unlock(&c->lock);
 
 		for (i = 0; i < nr; i++)
 			free_run(selected[i]);
@@ -410,13 +427,153 @@ static void compact_runs(struct work_struct *work)
 		continue;
 
 failed:
-		spin_lock_irqsave(&c->lock, flags);
+		mutex_lock(&c->lock);
 		unmark_compaction(selected, nr);
 		c->compaction_running = false;
-		spin_unlock_irqrestore(&c->lock, flags);
+		mutex_unlock(&c->lock);
 		DMERR("compaction failed: %d", ret);
 		return;
 	}
+}
+
+static int submit_clone_wait(struct zns_m1_c *c, struct bio *bio,
+			     sector_t physical_sector, bool remap_sector)
+{
+	struct bio *clone;
+	int ret;
+
+	clone = bio_alloc_clone(c->dev->bdev, bio, GFP_NOIO,
+				&c->clone_bioset);
+	if (!clone)
+		return -ENOMEM;
+
+	if (remap_sector)
+		clone->bi_iter.bi_sector = physical_sector;
+
+	ret = submit_bio_wait(clone);
+	bio_put(clone);
+	return ret;
+}
+
+static void complete_original_bio(struct bio *bio, int ret)
+{
+	if (ret)
+		bio->bi_status = errno_to_blk_status(ret);
+	bio_endio(bio);
+}
+
+static int process_read(struct zns_io_work *io)
+{
+	struct zns_m1_c *c = io->ctx;
+	struct bio *bio = io->bio;
+	struct map_entry *e;
+	sector_t physical = 0;
+	bool zero = false;
+
+	mutex_lock(&c->lock);
+	e = map_lookup(c, bio->bi_iter.bi_sector);
+	if (!e || e->tombstone)
+		zero = true;
+	else
+		physical = io->ti->begin +
+			(sector_t)e->zone_idx * c->zone_size + e->zone_offset;
+	mutex_unlock(&c->lock);
+
+	if (zero) {
+		zero_fill_bio(bio);
+		return 0;
+	}
+
+	return submit_clone_wait(c, bio, physical, true);
+}
+
+static int process_write(struct zns_io_work *io)
+{
+	struct zns_m1_c *c = io->ctx;
+	struct bio *bio = io->bio;
+	struct zone_state *az;
+	sector_t physical;
+	u32 zone_idx;
+	int ret;
+
+	mutex_lock(&c->lock);
+	az = &c->zones[c->active_zone];
+	if (az->wp + MAP_GRANULARITY_SECTORS > az->capacity) {
+		az->is_full = true;
+		ret = advance_active_zone(c);
+		if (ret) {
+			mutex_unlock(&c->lock);
+			DMERR("device full, no free zones");
+			return ret;
+		}
+		az = &c->zones[c->active_zone];
+	}
+
+	zone_idx = c->active_zone;
+	physical = io->ti->begin + (sector_t)zone_idx * c->zone_size + az->wp;
+	mutex_unlock(&c->lock);
+
+	ret = submit_clone_wait(c, bio, physical, true);
+	if (ret)
+		return ret;
+
+	mutex_lock(&c->lock);
+	az = &c->zones[zone_idx];
+	az->wp += MAP_GRANULARITY_SECTORS;
+	ret = map_insert(c, bio->bi_iter.bi_sector, zone_idx,
+			 az->wp - MAP_GRANULARITY_SECTORS, false);
+	mutex_unlock(&c->lock);
+	return ret;
+}
+
+static int process_discard(struct zns_io_work *io)
+{
+	struct zns_m1_c *c = io->ctx;
+	sector_t logical = io->bio->bi_iter.bi_sector;
+	sector_t end = logical + bio_sectors(io->bio);
+	int ret = 0;
+
+	mutex_lock(&c->lock);
+	while (logical < end) {
+		ret = map_insert(c, logical, 0, 0, true);
+		if (ret)
+			break;
+		logical += MAP_GRANULARITY_SECTORS;
+	}
+	mutex_unlock(&c->lock);
+	return ret;
+}
+
+static void process_io(struct work_struct *work)
+{
+	struct zns_io_work *io = container_of(work, struct zns_io_work, work);
+	struct bio *bio = io->bio;
+	int ret;
+
+	if (io->is_flush) {
+		ret = submit_clone_wait(io->ctx, bio, 0, false);
+		complete_original_bio(bio, ret);
+		return;
+	}
+
+	switch (bio_op(bio)) {
+	case REQ_OP_READ:
+		ret = process_read(io);
+		break;
+	case REQ_OP_WRITE:
+	case REQ_OP_WRITE_ZEROES:
+		ret = process_write(io);
+		break;
+	case REQ_OP_DISCARD:
+		ret = process_discard(io);
+		break;
+	default:
+		DMERR("unsupported bio operation: %u", bio_op(bio));
+		ret = -EOPNOTSUPP;
+		break;
+	}
+
+	complete_original_bio(bio, ret);
 }
 
 static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
@@ -437,7 +594,7 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOMEM;
 	}
 
-	spin_lock_init(&c->lock);
+	mutex_init(&c->lock);
 	c->active_memtable = RB_ROOT;
 	INIT_LIST_HEAD(&c->runs);
 	INIT_WORK(&c->compaction_work, compact_runs);
@@ -449,14 +606,34 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto err_free;
 	}
 
+	ret = bioset_init(&c->clone_bioset, CLONE_BIO_POOL_SIZE, 0,
+			  BIOSET_NEED_RESCUER);
+	if (ret) {
+		ti->error = "failed to create clone bioset";
+		goto err_compaction_wq;
+	}
+
+	c->io_wq = alloc_ordered_workqueue("zns_io", WQ_MEM_RECLAIM);
+	if (!c->io_wq) {
+		ti->error = "failed to create I/O workqueue";
+		ret = -ENOMEM;
+		goto err_bioset;
+	}
+
 	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
 			    &c->dev);
 	if (ret) {
 		ti->error = "failed to open underlying device";
-		goto err_wq;
+		goto err_io_wq;
 	}
 
 	bdev = c->dev->bdev;
+	if (MAP_BLOCK_SIZE % bdev_logical_block_size(bdev)) {
+		ti->error = "4 KiB mapping is not aligned to underlying device";
+		ret = -EINVAL;
+		goto err_put;
+	}
+
 	c->zone_size = bdev_zone_sectors(bdev);
 	if (!c->zone_size) {
 		ti->error = "underlying device is not zoned";
@@ -492,7 +669,7 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	/*
-	 * 매핑 하나가 512B sector 하나를 나타내도록 했음.
+	 * 매핑 하나가 4 KiB block 하나를 나타내도록 했음.
 	 * ext4의 읽기/쓰기 bio 경계가 달라도 찾을 수 있게 큰 bio도 같은
 	 * 단위로 나눔.
 	 */
@@ -504,6 +681,11 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	ti->private = c;
 	ti->num_flush_bios = 1;
+	ti->num_discard_bios = 1;
+	ti->num_write_zeroes_bios = 1;
+	ti->per_io_data_size = sizeof(struct zns_io_work);
+	ti->flush_supported = true;
+	ti->discards_supported = true;
 
 	DMINFO("ctr: target attached on top of '%s' (%u zones, %llu sectors/zone)",
 	       argv[0], c->nr_zones, (unsigned long long)c->zone_size);
@@ -513,7 +695,11 @@ err_zones:
 	kfree(c->zones);
 err_put:
 	dm_put_device(ti, c->dev);
-err_wq:
+err_io_wq:
+	destroy_workqueue(c->io_wq);
+err_bioset:
+	bioset_exit(&c->clone_bioset);
+err_compaction_wq:
 	destroy_workqueue(c->compaction_wq);
 err_free:
 	kfree(c);
@@ -525,13 +711,15 @@ static void zns_m1_dtr(struct dm_target *ti)
 	struct zns_m1_c *c = ti->private;
 	struct sorted_run *run;
 	struct sorted_run *tmp;
-	unsigned long flags;
 
-	spin_lock_irqsave(&c->lock, flags);
+	destroy_workqueue(c->io_wq);
+
+	mutex_lock(&c->lock);
 	c->stopping = true;
-	spin_unlock_irqrestore(&c->lock, flags);
+	mutex_unlock(&c->lock);
 	cancel_work_sync(&c->compaction_work);
 	destroy_workqueue(c->compaction_wq);
+	bioset_exit(&c->clone_bioset);
 
 	free_tree(&c->active_memtable);
 	list_for_each_entry_safe(run, tmp, &c->runs, list) {
@@ -545,93 +733,61 @@ static void zns_m1_dtr(struct dm_target *ti)
 	DMINFO("dtr: target detached");
 }
 
-static int complete_bio_error(struct bio *bio, blk_status_t status)
-{
-	bio->bi_status = status;
-	bio_endio(bio);
-	return DM_MAPIO_SUBMITTED;
-}
-
 static int zns_m1_map(struct dm_target *ti, struct bio *bio)
 {
 	struct zns_m1_c *c = ti->private;
-	sector_t logical_sector = bio->bi_iter.bi_sector;
+	struct zns_io_work *io;
+	sector_t sector = bio->bi_iter.bi_sector;
 	sector_t nr_sectors = bio_sectors(bio);
-	unsigned long flags;
+	bool is_flush = bio_op(bio) == REQ_OP_FLUSH ||
+		(!nr_sectors && (bio->bi_opf & REQ_PREFLUSH));
 
-	if (bio_op(bio) == REQ_OP_FLUSH) {
-		bio_set_dev(bio, c->dev->bdev);
-		return DM_MAPIO_REMAPPED;
-	}
-
-	/*
-	 * 논리 주소와 실제 저장 위치가 다르므로 discard를 그대로 내리면
-	 * 엉뚱한 위치가 지워질 수 있음. M2에서는 discard를 넘기지 않고
-	 * 바로 완료 처리했음. 매핑 무효화와 zone reset은 M3에서 처리함.
-	 */
-	if (bio_op(bio) == REQ_OP_DISCARD) {
-		bio_endio(bio);
-		return DM_MAPIO_SUBMITTED;
-	}
-
-	if (nr_sectors != MAP_GRANULARITY_SECTORS) {
-		DMERR("unexpected bio size: %llu sectors",
-		      (unsigned long long)nr_sectors);
-		return complete_bio_error(bio, BLK_STS_IOERR);
-	}
-
-	spin_lock_irqsave(&c->lock, flags);
-
-	if (bio_data_dir(bio) == READ) {
-		struct map_entry *e = map_lookup(c, logical_sector);
-
-		if (!e) {
-			spin_unlock_irqrestore(&c->lock, flags);
-			zero_fill_bio(bio);
-			bio_endio(bio);
-			return DM_MAPIO_SUBMITTED;
+	if (!is_flush) {
+		if (!IS_ALIGNED(sector, MAP_GRANULARITY_SECTORS) ||
+		    !IS_ALIGNED(nr_sectors, MAP_GRANULARITY_SECTORS) ||
+		    !nr_sectors) {
+			DMERR("unaligned bio: op=%u sector=%llu sectors=%llu",
+			      bio_op(bio), (unsigned long long)sector,
+			      (unsigned long long)nr_sectors);
+			return DM_MAPIO_KILL;
 		}
 
-		bio_set_dev(bio, c->dev->bdev);
-		bio->bi_iter.bi_sector = ti->begin +
-			(sector_t)e->zone_idx * c->zone_size + e->zone_offset;
-	} else {
-		struct zone_state *az = &c->zones[c->active_zone];
-
-		if (az->wp + nr_sectors > az->capacity) {
-			az->is_full = true;
-			if (advance_active_zone(c)) {
-				spin_unlock_irqrestore(&c->lock, flags);
-				DMERR("device full, no free zones");
-				return complete_bio_error(bio, BLK_STS_NOSPC);
-			}
-			az = &c->zones[c->active_zone];
-		}
-
-		if (map_insert(c, logical_sector, c->active_zone, az->wp)) {
-			spin_unlock_irqrestore(&c->lock, flags);
-			DMERR("map_insert OOM");
-			return complete_bio_error(bio, BLK_STS_RESOURCE);
-		}
-
-		bio_set_dev(bio, c->dev->bdev);
-		bio->bi_iter.bi_sector = ti->begin +
-			(sector_t)c->active_zone * c->zone_size + az->wp;
-		az->wp += nr_sectors;
+		if (bio_op(bio) != REQ_OP_DISCARD &&
+		    nr_sectors != MAP_GRANULARITY_SECTORS)
+			return DM_MAPIO_KILL;
 	}
 
-	spin_unlock_irqrestore(&c->lock, flags);
-	return DM_MAPIO_REMAPPED;
+	io = dm_per_bio_data(bio, sizeof(*io));
+	INIT_WORK(&io->work, process_io);
+	io->ctx = c;
+	io->ti = ti;
+	io->bio = bio;
+	io->is_flush = is_flush;
+	queue_work(c->io_wq, &io->work);
+	return DM_MAPIO_SUBMITTED;
+}
+
+static void zns_m1_io_hints(struct dm_target *ti,
+			    struct queue_limits *limits)
+{
+	limits->logical_block_size = MAP_BLOCK_SIZE;
+	limits->physical_block_size = MAP_BLOCK_SIZE;
+	limits->io_min = MAP_BLOCK_SIZE;
+	limits->io_opt = MAP_BLOCK_SIZE;
+	limits->discard_granularity = MAP_BLOCK_SIZE;
+	limits->max_hw_discard_sectors =
+		min_t(sector_t, ti->len, UINT_MAX);
 }
 
 static struct target_type zns_m1_target = {
 	.name = "zns-m1",
-	.version = { 0, 3, 0 },
+	.version = { 0, 4, 0 },
 	.features = 0,
 	.module = THIS_MODULE,
 	.ctr = zns_m1_ctr,
 	.dtr = zns_m1_dtr,
 	.map = zns_m1_map,
+	.io_hints = zns_m1_io_hints,
 };
 
 static int __init zns_m1_init(void)

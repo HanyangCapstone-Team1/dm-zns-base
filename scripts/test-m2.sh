@@ -18,6 +18,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SRC_DIR=$(cd "$SCRIPT_DIR/../src" && pwd)
 KO_PATH="$SRC_DIR/$MOD_NAME.ko"
 MOUNT_DIR=
+RAW_DIR=
 
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
 
@@ -28,6 +29,10 @@ cleanup() {
 	dmsetup remove "$DM_NAME" 2>/dev/null || true
 	rmmod "$MOD_NAME" 2>/dev/null || true
 	[ -z "$MOUNT_DIR" ] || rmdir "$MOUNT_DIR" 2>/dev/null || true
+	if [ -n "$RAW_DIR" ]; then
+		rm -f "$RAW_DIR/before.bin" "$RAW_DIR/after.bin" "$RAW_DIR/zero.bin"
+		rmdir "$RAW_DIR" 2>/dev/null || true
+	fi
 }
 trap cleanup EXIT
 
@@ -36,7 +41,7 @@ trap cleanup EXIT
 	exit 1
 }
 
-for cmd in dmsetup blkzone blockdev mkfs.ext4 mount umount md5sum; do
+for cmd in dmsetup blkzone blockdev blkdiscard mkfs.ext4 mount umount md5sum; do
 	command -v "$cmd" >/dev/null || {
 		echo "[!] Required command is missing: $cmd" >&2
 		exit 1
@@ -71,7 +76,38 @@ if [ "$zoned" != "none" ]; then
 	exit 2
 fi
 
+logical_block_size=$(cat "/sys/block/$dm_base/queue/logical_block_size")
+echo "[*] $DM_DEV logical_block_size=$logical_block_size"
+if [ "$logical_block_size" -ne 4096 ]; then
+	echo "[FAIL] DM logical block size is not 4096" >&2
+	exit 2
+fi
+
 before=$(dmesg | grep -Ec 'blk_update_request|I/O error' || true)
+
+echo "[*] Checking logical discard tombstone"
+RAW_DIR=$(mktemp -d /tmp/dm-zns-discard.XXXXXX)
+dd if=/dev/urandom of="$RAW_DIR/before.bin" bs=4K count=1 status=none
+dd if="$RAW_DIR/before.bin" of="$DM_DEV" bs=4K count=1 seek=128 \
+	oflag=direct conv=notrunc status=none || {
+	echo "[FAIL] discard setup write failed" >&2
+	exit 3
+}
+blkdiscard --offset $((128 * 4096)) --length 4096 "$DM_DEV" || {
+	echo "[FAIL] logical discard failed" >&2
+	exit 3
+}
+dd if="$DM_DEV" of="$RAW_DIR/after.bin" bs=4K count=1 skip=128 \
+	iflag=direct status=none || {
+	echo "[FAIL] read after discard failed" >&2
+	exit 3
+}
+dd if=/dev/zero of="$RAW_DIR/zero.bin" bs=4K count=1 status=none
+cmp "$RAW_DIR/zero.bin" "$RAW_DIR/after.bin" || {
+	echo "[FAIL] discarded logical block did not read as zero" >&2
+	exit 3
+}
+echo "[OK] discarded block reads as zero"
 
 echo "[*] Creating ext4 (discard disabled)"
 mkfs.ext4 -F -E nodiscard "$DM_DEV" >/dev/null || {
