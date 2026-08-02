@@ -4,7 +4,7 @@
  *
  * 상위에서는 일반 블록 장치로 보이게 했음.
  * 쓰기는 active zone의 wp에 순서대로 저장하고 논리 주소와 실제 저장
- * 위치는 메모리 해시 테이블에 기록함. M2에서는 ext4가 bio를 다르게
+ * 위치는 메모리 LSM 구조에 기록함. M2에서는 ext4가 bio를 다르게
  * 나눠 보내도 읽을 수 있도록 sector 단위로 매핑했음.
  */
 
@@ -12,14 +12,17 @@
 #include <linux/init.h>
 #include <linux/bio.h>
 #include <linux/device-mapper.h>
-#include <linux/hashtable.h>
+#include <linux/rbtree.h>
 #include <linux/spinlock.h>
 #include <linux/blkzoned.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 
 #define DM_MSG_PREFIX "zns-m1"
-#define MAP_HASH_BITS 15
 #define MAP_GRANULARITY_SECTORS 1
+#define MEMTABLE_MAX_ENTRIES 4096
+#define RUNS_PER_COMPACTION 4
+#define MAX_LSM_LEVELS 16
 
 struct zone_state {
 	sector_t wp;
@@ -32,7 +35,17 @@ struct map_entry {
 	sector_t logical_sector;
 	u32 zone_idx;
 	sector_t zone_offset;
-	struct hlist_node node;
+	u64 sequence;
+	struct rb_node node;
+};
+
+struct sorted_run {
+	struct rb_root root;
+	u32 nr_entries;
+	u32 level;
+	u64 generation;
+	bool compacting;
+	struct list_head list;
 };
 
 struct zns_m1_c {
@@ -41,39 +54,186 @@ struct zns_m1_c {
 	sector_t zone_size;
 	struct zone_state *zones;
 	u32 active_zone;
-	DECLARE_HASHTABLE(map, MAP_HASH_BITS);
+	struct rb_root active_memtable;
+	u32 active_entries;
+	u64 next_sequence;
+	u64 next_generation;
+	struct list_head runs;
+	u32 nr_runs;
+	struct workqueue_struct *compaction_wq;
+	struct work_struct compaction_work;
+	bool compaction_running;
+	bool stopping;
 	spinlock_t lock;
 };
 
-static struct map_entry *map_lookup(struct zns_m1_c *c,
-				    sector_t logical_sector)
+static struct map_entry *tree_lookup(struct rb_root *root,
+				     sector_t logical_sector)
 {
-	struct map_entry *e;
+	struct rb_node *node = root->rb_node;
 
-	hash_for_each_possible(c->map, e, node, (u32)logical_sector) {
-		if (e->logical_sector == logical_sector)
+	while (node) {
+		struct map_entry *e = rb_entry(node, struct map_entry, node);
+
+		if (logical_sector < e->logical_sector)
+			node = node->rb_left;
+		else if (logical_sector > e->logical_sector)
+			node = node->rb_right;
+		else
 			return e;
 	}
 
 	return NULL;
 }
 
+static int tree_insert(struct rb_root *root, sector_t logical, u32 zone_idx,
+		       sector_t zone_offset, u64 sequence, gfp_t gfp,
+		       bool replace_newer)
+{
+	struct rb_node **link = &root->rb_node;
+	struct rb_node *parent = NULL;
+	struct map_entry *e;
+
+	while (*link) {
+		parent = *link;
+		e = rb_entry(parent, struct map_entry, node);
+
+		if (logical < e->logical_sector) {
+			link = &parent->rb_left;
+		} else if (logical > e->logical_sector) {
+			link = &parent->rb_right;
+		} else {
+			if (!replace_newer || sequence >= e->sequence) {
+				e->zone_idx = zone_idx;
+				e->zone_offset = zone_offset;
+				e->sequence = sequence;
+			}
+			return 0;
+		}
+	}
+
+	e = kmalloc(sizeof(*e), gfp);
+	if (!e)
+		return -ENOMEM;
+
+	e->logical_sector = logical;
+	e->zone_idx = zone_idx;
+	e->zone_offset = zone_offset;
+	e->sequence = sequence;
+	rb_link_node(&e->node, parent, link);
+	rb_insert_color(&e->node, root);
+	return 1;
+}
+
+static void free_tree(struct rb_root *root)
+{
+	struct rb_node *node;
+
+	while ((node = rb_first(root))) {
+		struct map_entry *e = rb_entry(node, struct map_entry, node);
+
+		rb_erase(node, root);
+		kfree(e);
+	}
+}
+
+static void free_run(struct sorted_run *run)
+{
+	free_tree(&run->root);
+	kfree(run);
+}
+
+static struct map_entry *map_lookup(struct zns_m1_c *c,
+				    sector_t logical_sector)
+{
+	struct map_entry *best;
+	struct sorted_run *run;
+
+	best = tree_lookup(&c->active_memtable, logical_sector);
+	list_for_each_entry(run, &c->runs, list) {
+		struct map_entry *e = tree_lookup(&run->root, logical_sector);
+
+		if (e && (!best || e->sequence > best->sequence))
+			best = e;
+	}
+
+	return best;
+}
+
+static unsigned int count_level_runs(struct zns_m1_c *c, u32 level)
+{
+	struct sorted_run *run;
+	unsigned int count = 0;
+
+	list_for_each_entry(run, &c->runs, list) {
+		if (run->level == level && !run->compacting)
+			count++;
+	}
+
+	return count;
+}
+
+static bool compaction_needed(struct zns_m1_c *c)
+{
+	u32 level;
+
+	for (level = 0; level < MAX_LSM_LEVELS - 1; level++) {
+		if (count_level_runs(c, level) >= RUNS_PER_COMPACTION)
+			return true;
+	}
+
+	return false;
+}
+
+static void maybe_queue_compaction(struct zns_m1_c *c)
+{
+	if (!c->stopping && !c->compaction_running &&
+	    compaction_needed(c)) {
+		c->compaction_running = true;
+		queue_work(c->compaction_wq, &c->compaction_work);
+	}
+}
+
+static void rotate_memtable(struct zns_m1_c *c)
+{
+	struct sorted_run *run;
+
+	if (c->active_entries < MEMTABLE_MAX_ENTRIES)
+		return;
+
+	run = kmalloc(sizeof(*run), GFP_ATOMIC);
+	if (!run)
+		return;
+
+	run->root = c->active_memtable;
+	run->nr_entries = c->active_entries;
+	run->level = 0;
+	run->generation = ++c->next_generation;
+	run->compacting = false;
+	INIT_LIST_HEAD(&run->list);
+	list_add(&run->list, &c->runs);
+	c->nr_runs++;
+
+	c->active_memtable = RB_ROOT;
+	c->active_entries = 0;
+	DMINFO("memtable rotated: run=%llu entries=%u",
+	       (unsigned long long)run->generation, run->nr_entries);
+	maybe_queue_compaction(c);
+}
+
 static int map_insert(struct zns_m1_c *c, sector_t logical, u32 zone_idx,
 		      sector_t zone_offset)
 {
-	struct map_entry *e = map_lookup(c, logical);
+	int ret;
 
-	if (!e) {
-		e = kmalloc(sizeof(*e), GFP_ATOMIC);
-		if (!e)
-			return -ENOMEM;
+	ret = tree_insert(&c->active_memtable, logical, zone_idx, zone_offset,
+			  ++c->next_sequence, GFP_ATOMIC, false);
+	if (ret < 0)
+		return ret;
+	if (ret > 0)
+		c->active_entries++;
 
-		e->logical_sector = logical;
-		hash_add(c->map, &e->node, (u32)logical);
-	}
-
-	e->zone_idx = zone_idx;
-	e->zone_offset = zone_offset;
+	rotate_memtable(c);
 	return 0;
 }
 
@@ -125,6 +285,140 @@ static int find_initial_active_zone(struct zns_m1_c *c)
 	return -ENOSPC;
 }
 
+static int select_compaction(struct zns_m1_c *c,
+			     struct sorted_run **selected, u32 *level)
+{
+	struct sorted_run *run;
+	u32 candidate;
+	unsigned int nr;
+
+	for (candidate = 0; candidate < MAX_LSM_LEVELS - 1; candidate++) {
+		if (count_level_runs(c, candidate) < RUNS_PER_COMPACTION)
+			continue;
+
+		nr = 0;
+		list_for_each_entry_reverse(run, &c->runs, list) {
+			if (run->level != candidate || run->compacting)
+				continue;
+
+			run->compacting = true;
+			selected[nr++] = run;
+			if (nr == RUNS_PER_COMPACTION)
+				break;
+		}
+
+		if (nr == RUNS_PER_COMPACTION) {
+			*level = candidate;
+			return nr;
+		}
+	}
+
+	return 0;
+}
+
+static void unmark_compaction(struct sorted_run **selected, unsigned int nr)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr; i++)
+		selected[i]->compacting = false;
+}
+
+static void compact_runs(struct work_struct *work)
+{
+	struct zns_m1_c *c = container_of(work, struct zns_m1_c,
+					  compaction_work);
+	struct sorted_run *selected[RUNS_PER_COMPACTION];
+	unsigned long flags;
+
+	while (1) {
+		struct sorted_run *output;
+		u64 generation = 0;
+		u32 level = 0;
+		unsigned int nr;
+		unsigned int i;
+		int ret = 0;
+
+		spin_lock_irqsave(&c->lock, flags);
+		if (c->stopping) {
+			c->compaction_running = false;
+			spin_unlock_irqrestore(&c->lock, flags);
+			return;
+		}
+
+		nr = select_compaction(c, selected, &level);
+		if (!nr) {
+			c->compaction_running = false;
+			spin_unlock_irqrestore(&c->lock, flags);
+			return;
+		}
+		spin_unlock_irqrestore(&c->lock, flags);
+
+		output = kzalloc(sizeof(*output), GFP_KERNEL);
+		if (!output) {
+			ret = -ENOMEM;
+			goto failed;
+		}
+
+		output->root = RB_ROOT;
+		output->level = level + 1;
+		INIT_LIST_HEAD(&output->list);
+
+		for (i = 0; i < nr && !ret; i++) {
+			struct rb_node *node;
+
+			generation = max(generation, selected[i]->generation);
+			for (node = rb_first(&selected[i]->root); node;
+			     node = rb_next(node)) {
+				struct map_entry *e;
+				int inserted;
+
+				e = rb_entry(node, struct map_entry, node);
+				inserted = tree_insert(&output->root,
+						e->logical_sector, e->zone_idx,
+						e->zone_offset, e->sequence,
+						GFP_KERNEL, true);
+				if (inserted < 0) {
+					ret = inserted;
+					break;
+				}
+				if (inserted > 0)
+					output->nr_entries++;
+			}
+		}
+
+		if (ret) {
+			free_run(output);
+			goto failed;
+		}
+
+		output->generation = generation;
+		spin_lock_irqsave(&c->lock, flags);
+		for (i = 0; i < nr; i++) {
+			list_del(&selected[i]->list);
+			c->nr_runs--;
+		}
+		list_add_tail(&output->list, &c->runs);
+		c->nr_runs++;
+		spin_unlock_irqrestore(&c->lock, flags);
+
+		for (i = 0; i < nr; i++)
+			free_run(selected[i]);
+
+		DMINFO("compaction: L%u %u runs -> L%u (%u entries)",
+		       level, nr, output->level, output->nr_entries);
+		continue;
+
+failed:
+		spin_lock_irqsave(&c->lock, flags);
+		unmark_compaction(selected, nr);
+		c->compaction_running = false;
+		spin_unlock_irqrestore(&c->lock, flags);
+		DMERR("compaction failed: %d", ret);
+		return;
+	}
+}
+
 static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct zns_m1_c *c;
@@ -144,13 +438,22 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	spin_lock_init(&c->lock);
-	hash_init(c->map);
+	c->active_memtable = RB_ROOT;
+	INIT_LIST_HEAD(&c->runs);
+	INIT_WORK(&c->compaction_work, compact_runs);
+	c->compaction_wq = alloc_ordered_workqueue("zns_lsm_compact",
+						  WQ_MEM_RECLAIM);
+	if (!c->compaction_wq) {
+		ti->error = "failed to create compaction workqueue";
+		ret = -ENOMEM;
+		goto err_free;
+	}
 
 	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
 			    &c->dev);
 	if (ret) {
 		ti->error = "failed to open underlying device";
-		goto err_free;
+		goto err_wq;
 	}
 
 	bdev = c->dev->bdev;
@@ -210,6 +513,8 @@ err_zones:
 	kfree(c->zones);
 err_put:
 	dm_put_device(ti, c->dev);
+err_wq:
+	destroy_workqueue(c->compaction_wq);
 err_free:
 	kfree(c);
 	return ret;
@@ -218,13 +523,20 @@ err_free:
 static void zns_m1_dtr(struct dm_target *ti)
 {
 	struct zns_m1_c *c = ti->private;
-	struct map_entry *e;
-	struct hlist_node *tmp;
-	unsigned int bkt;
+	struct sorted_run *run;
+	struct sorted_run *tmp;
+	unsigned long flags;
 
-	hash_for_each_safe(c->map, bkt, tmp, e, node) {
-		hash_del(&e->node);
-		kfree(e);
+	spin_lock_irqsave(&c->lock, flags);
+	c->stopping = true;
+	spin_unlock_irqrestore(&c->lock, flags);
+	cancel_work_sync(&c->compaction_work);
+	destroy_workqueue(c->compaction_wq);
+
+	free_tree(&c->active_memtable);
+	list_for_each_entry_safe(run, tmp, &c->runs, list) {
+		list_del(&run->list);
+		free_run(run);
 	}
 
 	kfree(c->zones);
@@ -314,7 +626,7 @@ static int zns_m1_map(struct dm_target *ti, struct bio *bio)
 
 static struct target_type zns_m1_target = {
 	.name = "zns-m1",
-	.version = { 0, 2, 0 },
+	.version = { 0, 3, 0 },
 	.features = 0,
 	.module = THIS_MODULE,
 	.ctr = zns_m1_ctr,
@@ -343,6 +655,6 @@ static void __exit zns_m1_exit(void)
 module_init(zns_m1_init);
 module_exit(zns_m1_exit);
 
-MODULE_DESCRIPTION("ZNS M1/M2: random-to-sequential DM target");
+MODULE_DESCRIPTION("ZNS M1/M2: in-memory LSM mapping DM target");
 MODULE_AUTHOR("SPLAB");
 MODULE_LICENSE("GPL");
