@@ -182,7 +182,7 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     ti->num_flush_bios = 1;
     ti->num_discard_bios = 1;
 
-    DMINFO("ctr: target attached on top of '%s'", c->nr_zones, (unsigned long long)c->zone_size, argv[0]);
+    DMINFO("ctr: target attached on top of '%s' (%u zones, %llu sectors/zone)", argv[0], c->nr_zones, (unsigned long long)c->zone_size);
     return 0;
 
 err_zones:
