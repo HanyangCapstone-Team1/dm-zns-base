@@ -32,6 +32,7 @@ sudo bash scripts/test-basic.sh   # ALL CHECKS PASSED 까지
 | [06-build-and-run](docs/06-build-and-run.md) | 빌드 / 적재 / 테스트 / 진단 |
 | [07-milestones](docs/07-milestones.md) | M0 → M4 마일스톤과 성공 기준 |
 | [08-references](docs/08-references.md) | 공식 문서, prior art, 참고 자료 |
+| [09-m1-code-walkthrough](docs/09-m1-code-walkthrough.md) | M1 random-to-sequential prototype 코드 설명 |
 
 ## 구조
 
