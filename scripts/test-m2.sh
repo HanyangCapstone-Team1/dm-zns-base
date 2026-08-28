@@ -90,6 +90,13 @@ if [ "$discard_max_bytes" -lt 4096 ]; then
 	exit 2
 fi
 
+write_zeroes_max_bytes=$(cat "/sys/block/$dm_base/queue/write_zeroes_max_bytes")
+echo "[*] $DM_DEV write_zeroes_max_bytes=$write_zeroes_max_bytes"
+if [ "$write_zeroes_max_bytes" -lt 4096 ]; then
+	echo "[FAIL] DM device does not advertise WRITE_ZEROES" >&2
+	exit 2
+fi
+
 before=$(dmesg | grep -Ec 'blk_update_request|I/O error' || true)
 
 echo "[*] Checking logical discard tombstone"
@@ -115,6 +122,27 @@ cmp "$RAW_DIR/zero.bin" "$RAW_DIR/after.bin" || {
 	exit 3
 }
 echo "[OK] discarded block reads as zero"
+
+echo "[*] Checking WRITE_ZEROES conversion"
+dd if="$RAW_DIR/before.bin" of="$DM_DEV" bs=4K count=1 seek=129 \
+	oflag=direct conv=notrunc status=none || {
+	echo "[FAIL] WRITE_ZEROES setup write failed" >&2
+	exit 3
+}
+blkdiscard --zeroout --offset $((129 * 4096)) --length 4096 "$DM_DEV" || {
+	echo "[FAIL] WRITE_ZEROES request failed" >&2
+	exit 3
+}
+dd if="$DM_DEV" of="$RAW_DIR/after-zeroes.bin" bs=4K count=1 skip=129 \
+	iflag=direct status=none || {
+	echo "[FAIL] read after WRITE_ZEROES failed" >&2
+	exit 3
+}
+cmp "$RAW_DIR/zero.bin" "$RAW_DIR/after-zeroes.bin" || {
+	echo "[FAIL] WRITE_ZEROES result was not zero" >&2
+	exit 3
+}
+echo "[OK] WRITE_ZEROES was converted to sequential write"
 
 echo "[*] Creating ext4 (discard disabled)"
 mkfs.ext4 -F -E nodiscard "$DM_DEV" >/dev/null || {
