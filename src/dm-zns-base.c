@@ -27,14 +27,36 @@
 #define RUNS_PER_COMPACTION 4
 #define MAX_LSM_LEVELS 16
 #define CLONE_BIO_POOL_SIZE 128
+#define DEFAULT_ACTIVE_ZONE_POOL_SIZE 2
+#define INVALID_ZONE_IDX U32_MAX
+
+enum gc_policy_type {
+   GC_POLICY_GREEDY,
+   GC_POLICY_COST_BENEFIT,
+};
+
+static char *gc_policy = "cost-benefit";
+module_param(gc_policy, charp, 0444);
+MODULE_PARM_DESC(gc_policy, "GC victim policy: greedy or cost-benefit");
+
+static unsigned int active_zone_pool_size = DEFAULT_ACTIVE_ZONE_POOL_SIZE;
+module_param(active_zone_pool_size, uint, 0444);
+MODULE_PARM_DESC(active_zone_pool_size, "Number of zones in the active write pool");
+
+enum zone_role {
+   ZONE_ROLE_CLOSED,
+   ZONE_ROLE_FREE,
+   ZONE_ROLE_ACTIVE,
+   ZONE_ROLE_RESERVE,
+};
 
 struct zone_state {
    sector_t wp;
    sector_t capacity;
    u64 valid_sectors;
    u64 invalid_sectors;
-   bool is_active;
-   bool is_full;
+   u64 last_modified_generation;
+   enum zone_role role;
 };
 
 struct gc_move {
@@ -74,14 +96,21 @@ struct sorted_run {
 
 struct zns_m1_c {
    struct dm_dev *dev;
+   struct dm_target *ti;
    u32 nr_zones;
    sector_t zone_size;
    struct zone_state *zones;
-   u32 active_zone;
+   u32 *active_zones;
+   u32 nr_active_zones;
+   u32 *free_zones;
+   u32 nr_free_zones;
    u32 reserve_zone;
    u64 gc_count;
    u64 gc_moved_sectors;
    u64 gc_reclaimed_sectors;
+   u64 compaction_gc_count;
+   u64 write_generation;
+   enum gc_policy_type gc_policy;
    struct rb_root active_memtable;
    u32 active_entries;
    u64 next_sequence;
@@ -90,6 +119,7 @@ struct zns_m1_c {
    u32 nr_runs;
    struct workqueue_struct *compaction_wq;
    struct work_struct compaction_work;
+   struct work_struct compaction_gc_work;
    bool compaction_running;
    bool stopping;
    struct workqueue_struct *io_wq;
@@ -291,24 +321,66 @@ static int map_insert(struct zns_m1_c *c, sector_t logical, u32 zone_idx,
    return 0;
 }
 
-static int advance_active_zone(struct zns_m1_c *c)
+static u32 pop_free_zone(struct zns_m1_c *c)
 {
-   u32 i;
+   u32 zone_idx;
 
-   for (i = 0; i < c->nr_zones; i++) {
-      if (i == c->reserve_zone)
-         continue;
-      if (!c->zones[i].is_full && !c->zones[i].is_active &&
-          c->zones[i].wp == 0) {
-         c->zones[c->active_zone].is_active = false;
-         c->active_zone = i;
-         c->zones[i].is_active = true;
-         DMINFO("active zone -> %u", i);
-         return 0;
-      }
+   if (!c->nr_free_zones)
+      return INVALID_ZONE_IDX;
+
+   zone_idx = c->free_zones[--c->nr_free_zones];
+   c->zones[zone_idx].role = ZONE_ROLE_ACTIVE;
+   return zone_idx;
+}
+
+static int push_free_zone(struct zns_m1_c *c, u32 zone_idx)
+{
+   if (c->nr_free_zones >= c->nr_zones)
+      return -EOVERFLOW;
+
+   c->zones[zone_idx].role = ZONE_ROLE_FREE;
+   c->free_zones[c->nr_free_zones++] = zone_idx;
+   return 0;
+}
+
+static int replace_active_zone(struct zns_m1_c *c, u32 active_slot)
+{
+   u32 old_zone = c->active_zones[active_slot];
+   u32 new_zone = pop_free_zone(c);
+
+   if (new_zone == INVALID_ZONE_IDX)
+      return -ENOSPC;
+
+   c->zones[old_zone].role = ZONE_ROLE_CLOSED;
+   c->active_zones[active_slot] = new_zone;
+   DMINFO("active pool replace: slot=%u old=%u new=%u free=%u",
+          active_slot, old_zone, new_zone, c->nr_free_zones);
+   return 0;
+}
+
+static u32 select_active_slot(struct zns_m1_c *c, sector_t logical_sector)
+{
+   u64 logical_block = logical_sector / MAP_GRANULARITY_SECTORS;
+
+   return do_div(logical_block, c->nr_active_zones);
+}
+
+static int prepare_active_zone(struct zns_m1_c *c, sector_t logical_sector,
+                  u32 *active_slot)
+{
+   u32 slot = select_active_slot(c, logical_sector);
+   u32 zone_idx = c->active_zones[slot];
+   struct zone_state *zone = &c->zones[zone_idx];
+
+   *active_slot = slot;
+   if (zone->wp + MAP_GRANULARITY_SECTORS <= zone->capacity) {
+      return 0;
    }
 
-   return -ENOSPC;
+   if (replace_active_zone(c, slot))
+      return -ENOSPC;
+
+   return 0;
 }
 
 static int fill_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
@@ -322,35 +394,52 @@ static int fill_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
    c->zones[idx].wp = zone->wp - zone->start;
    c->zones[idx].valid_sectors = 0;
    c->zones[idx].invalid_sectors = 0;
-   c->zones[idx].is_full = zone->cond == BLK_ZONE_COND_FULL;
-   c->zones[idx].is_active = false;
+   c->zones[idx].role = ZONE_ROLE_CLOSED;
    return 0;
 }
 
-static int find_initial_zones(struct zns_m1_c *c)
+static int initialize_zone_pool(struct zns_m1_c *c, struct block_device *bdev)
 {
+   unsigned int pool_size = active_zone_pool_size;
+   unsigned int max_open = bdev_max_open_zones(bdev);
+   unsigned int max_active = bdev_max_active_zones(bdev);
    u32 i;
-   bool active_found = false;
 
-   for (i = 0; i < c->nr_zones; i++) {
-      if (!c->zones[i].is_full &&
-          c->zones[i].wp < c->zones[i].capacity &&
-          IS_ALIGNED(c->zones[i].wp, MAP_GRANULARITY_SECTORS)) {
-         if (!active_found) {
-            c->active_zone = i;
-            c->zones[i].is_active = true;
-            active_found = true;
-            continue;
-         }
+   if (!pool_size)
+      return -EINVAL;
+   if (max_open)
+      pool_size = min(pool_size, max_open);
+   if (max_active)
+      pool_size = min(pool_size, max_active);
+   pool_size = min(pool_size, c->nr_zones - 1);
+   if (!pool_size)
+      return -ENOSPC;
 
-         if (c->zones[i].wp == 0) {
-            c->reserve_zone = i;
-            return 0;
-         }
+   for (i = c->nr_zones; i-- > 0;) {
+      struct zone_state *zone = &c->zones[i];
+
+      if (!zone->wp && zone->capacity >= MAP_GRANULARITY_SECTORS) {
+         zone->role = ZONE_ROLE_FREE;
+         c->free_zones[c->nr_free_zones++] = i;
       }
    }
 
-   return -ENOSPC;
+   if (c->nr_free_zones < pool_size + 1)
+      return -ENOSPC;
+
+   c->nr_active_zones = pool_size;
+   for (i = 0; i < c->nr_active_zones; i++)
+      c->active_zones[i] = pop_free_zone(c);
+
+   c->reserve_zone = pop_free_zone(c);
+   c->zones[c->reserve_zone].role = ZONE_ROLE_RESERVE;
+
+   DMINFO("active pool initialized: active=%u reserve=%u free=%u",
+          c->nr_active_zones, c->reserve_zone, c->nr_free_zones);
+   for (i = 0; i < c->nr_active_zones; i++)
+      DMINFO("active pool: slot=%u zone=%u", i, c->active_zones[i]);
+
+   return 0;
 }
 
 static int select_compaction(struct zns_m1_c *c,
@@ -474,6 +563,8 @@ static void compact_runs(struct work_struct *work)
 
       DMINFO("compaction: L%u %u runs -> L%u (%u entries)",
              level, nr, output->level, output->nr_entries);
+      if (!READ_ONCE(c->stopping))
+         queue_work(c->io_wq, &c->compaction_gc_work);
       continue;
 
 failed:
@@ -486,7 +577,26 @@ failed:
    }
 }
 
-static int select_greedy_victim(struct zns_m1_c *c, u32 *victim)
+static const char *gc_policy_name(enum gc_policy_type policy)
+{
+   return policy == GC_POLICY_COST_BENEFIT ? "cost-benefit" : "greedy";
+}
+
+static bool zone_is_gc_candidate(struct zns_m1_c *c, u32 zone_idx,
+                  u64 max_valid_sectors)
+{
+   struct zone_state *zone = &c->zones[zone_idx];
+
+   if (zone->role != ZONE_ROLE_CLOSED || !zone->wp ||
+       !zone->invalid_sectors)
+      return false;
+
+   return zone->valid_sectors <= max_valid_sectors;
+}
+
+static int select_greedy_victim(struct zns_m1_c *c, u32 *victim,
+                 u64 *victim_age, u64 *victim_score,
+                 u64 max_valid_sectors)
 {
    u64 best_invalid = 0;
    sector_t best_used = 1;
@@ -496,11 +606,7 @@ static int select_greedy_victim(struct zns_m1_c *c, u32 *victim)
    for (i = 0; i < c->nr_zones; i++) {
       struct zone_state *zone = &c->zones[i];
 
-      if (i == c->active_zone || i == c->reserve_zone || !zone->wp ||
-          !zone->invalid_sectors)
-         continue;
-      if (zone->valid_sectors + MAP_GRANULARITY_SECTORS >
-          c->zones[c->reserve_zone].capacity)
+      if (!zone_is_gc_candidate(c, i, max_valid_sectors))
          continue;
 
       if (!found ||
@@ -513,7 +619,72 @@ static int select_greedy_victim(struct zns_m1_c *c, u32 *victim)
       }
    }
 
+   if (found) {
+      *victim_age = c->write_generation -
+         c->zones[*victim].last_modified_generation;
+      *victim_score = mul_u64_u64_div_u64(best_invalid, 1000,
+                           best_used);
+   }
+
    return found ? 0 : -ENOSPC;
+}
+
+static int select_cost_benefit_victim(struct zns_m1_c *c, u32 *victim,
+                      u64 *victim_age, u64 *victim_score,
+                      u64 max_valid_sectors)
+{
+   u64 best_score = 0;
+   u64 best_age = 0;
+   u64 best_invalid = 0;
+   sector_t best_used = 1;
+   u32 i;
+   bool found = false;
+
+   for (i = 0; i < c->nr_zones; i++) {
+      struct zone_state *zone = &c->zones[i];
+      u64 denominator;
+      u64 score;
+      u64 age;
+
+      if (!zone_is_gc_candidate(c, i, max_valid_sectors))
+         continue;
+
+      age = c->write_generation - zone->last_modified_generation;
+      denominator = (u64)zone->wp + zone->valid_sectors;
+      score = mul_u64_u64_div_u64(age, zone->invalid_sectors,
+                       denominator);
+
+      if (!found || score > best_score ||
+          (score == best_score &&
+           zone->invalid_sectors * (u64)best_used >
+           best_invalid * (u64)zone->wp)) {
+         *victim = i;
+         best_score = score;
+         best_age = age;
+         best_invalid = zone->invalid_sectors;
+         best_used = zone->wp;
+         found = true;
+      }
+   }
+
+   if (found) {
+      *victim_age = best_age;
+      *victim_score = best_score;
+   }
+
+   return found ? 0 : -ENOSPC;
+}
+
+static int select_gc_victim(struct zns_m1_c *c, u32 *victim,
+               u64 *victim_age, u64 *victim_score,
+               u64 max_valid_sectors)
+{
+   if (c->gc_policy == GC_POLICY_COST_BENEFIT)
+      return select_cost_benefit_victim(c, victim, victim_age,
+                         victim_score, max_valid_sectors);
+
+   return select_greedy_victim(c, victim, victim_age, victim_score,
+                    max_valid_sectors);
 }
 
 static int collect_tree_gc_moves(struct zns_m1_c *c, struct rb_root *root,
@@ -619,31 +790,16 @@ static int copy_gc_block(struct zns_m1_c *c, sector_t source,
    return ret;
 }
 
-static int run_greedy_gc(struct zns_m1_c *c, struct dm_target *ti)
+static int relocate_victim(struct zns_m1_c *c, struct dm_target *ti,
+              u32 victim, u32 destination, u64 *moved_sectors)
 {
    LIST_HEAD(moves);
    struct gc_move *move;
    u64 nr_moves = 0;
-   u64 moved_sectors = 0;
-   u64 reclaimable;
-   u32 victim;
-   u32 destination;
    int ret;
 
+   *moved_sectors = 0;
    mutex_lock(&c->lock);
-   ret = select_greedy_victim(c, &victim);
-   if (ret) {
-      mutex_unlock(&c->lock);
-      return ret;
-   }
-
-   destination = c->reserve_zone;
-   if (c->zones[destination].wp != 0) {
-      mutex_unlock(&c->lock);
-      return -ENOSPC;
-   }
-
-   reclaimable = c->zones[victim].invalid_sectors;
    ret = collect_gc_moves(c, victim, &moves, &nr_moves);
    if (!ret && nr_moves * MAP_GRANULARITY_SECTORS !=
        c->zones[victim].valid_sectors)
@@ -651,11 +807,6 @@ static int run_greedy_gc(struct zns_m1_c *c, struct dm_target *ti)
    mutex_unlock(&c->lock);
    if (ret)
       goto out_free;
-
-   DMINFO("gc start: victim=%u destination=%u valid=%llu invalid=%llu",
-          victim, destination,
-          (unsigned long long)(nr_moves * MAP_GRANULARITY_SECTORS),
-          (unsigned long long)reclaimable);
 
    list_for_each_entry(move, &moves, list) {
       struct map_entry *latest;
@@ -683,8 +834,11 @@ static int run_greedy_gc(struct zns_m1_c *c, struct dm_target *ti)
 
       mutex_lock(&c->lock);
       c->zones[destination].wp += MAP_GRANULARITY_SECTORS;
+      c->zones[destination].last_modified_generation =
+         ++c->write_generation;
       latest = map_lookup(c, move->logical_sector);
-      if (!latest || latest->tombstone || latest->sequence != move->sequence ||
+      if (!latest || latest->tombstone ||
+          latest->sequence != move->sequence ||
           latest->zone_idx != victim ||
           latest->zone_offset != move->source_offset) {
          c->zones[destination].invalid_sectors +=
@@ -699,52 +853,212 @@ static int run_greedy_gc(struct zns_m1_c *c, struct dm_target *ti)
          c->zones[destination].invalid_sectors +=
             MAP_GRANULARITY_SECTORS;
       else
-         moved_sectors += MAP_GRANULARITY_SECTORS;
+         *moved_sectors += MAP_GRANULARITY_SECTORS;
       mutex_unlock(&c->lock);
       if (ret)
          goto out_free;
    }
 
    mutex_lock(&c->lock);
-   if (c->zones[victim].valid_sectors) {
-      mutex_unlock(&c->lock);
+   if (c->zones[victim].valid_sectors)
       ret = -EUCLEAN;
-      goto out_free;
-   }
    mutex_unlock(&c->lock);
+
+out_free:
+   free_gc_moves(&moves);
+   return ret;
+}
+
+static int run_zone_gc(struct zns_m1_c *c, struct dm_target *ti,
+             u32 active_slot)
+{
+   u64 moved_sectors = 0;
+   u64 reclaimable;
+   u64 victim_age;
+   u64 victim_score;
+   u32 old_active;
+   u32 victim;
+   u32 destination;
+   int ret;
+
+   mutex_lock(&c->lock);
+   old_active = c->active_zones[active_slot];
+   ret = select_gc_victim(c, &victim, &victim_age, &victim_score,
+              c->zones[c->reserve_zone].capacity -
+              MAP_GRANULARITY_SECTORS);
+   if (ret) {
+      mutex_unlock(&c->lock);
+      return ret;
+   }
+
+   destination = c->reserve_zone;
+   if (c->zones[destination].wp != 0) {
+      mutex_unlock(&c->lock);
+      return -ENOSPC;
+   }
+
+   reclaimable = c->zones[victim].invalid_sectors;
+   moved_sectors = c->zones[victim].valid_sectors;
+   mutex_unlock(&c->lock);
+
+   DMINFO("gc start: policy=%s victim=%u destination=%u valid=%llu invalid=%llu age=%llu score=%llu",
+          gc_policy_name(c->gc_policy), victim, destination,
+          (unsigned long long)moved_sectors,
+          (unsigned long long)reclaimable,
+          (unsigned long long)victim_age,
+          (unsigned long long)victim_score);
+
+   ret = relocate_victim(c, ti, victim, destination, &moved_sectors);
+   if (ret)
+      goto out_error;
 
    ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
                ti->begin + (sector_t)victim * c->zone_size,
                c->zone_size, GFP_NOIO);
    if (ret)
-      goto out_free;
+      goto out_error;
 
    mutex_lock(&c->lock);
-   c->zones[c->active_zone].is_active = false;
+   c->zones[old_active].role = ZONE_ROLE_CLOSED;
    c->zones[victim].wp = 0;
    c->zones[victim].valid_sectors = 0;
    c->zones[victim].invalid_sectors = 0;
-   c->zones[victim].is_full = false;
-   c->zones[victim].is_active = false;
-   c->active_zone = destination;
-   c->zones[destination].is_active = true;
-   c->zones[destination].is_full =
-      c->zones[destination].wp >= c->zones[destination].capacity;
+   c->zones[victim].last_modified_generation = 0;
+   c->zones[victim].role = ZONE_ROLE_RESERVE;
+   c->active_zones[active_slot] = destination;
+   c->zones[destination].role = ZONE_ROLE_ACTIVE;
    c->reserve_zone = victim;
    c->gc_count++;
    c->gc_moved_sectors += moved_sectors;
    c->gc_reclaimed_sectors += reclaimable;
    mutex_unlock(&c->lock);
 
-   DMINFO("gc complete: victim=%u moved=%llu reclaimed=%llu reserve=%u",
-          victim, (unsigned long long)moved_sectors,
-          (unsigned long long)reclaimable, victim);
+   DMINFO("gc complete: policy=%s victim=%u moved=%llu reclaimed=%llu active_slot=%u active=%u reserve=%u",
+          gc_policy_name(c->gc_policy), victim,
+          (unsigned long long)moved_sectors,
+          (unsigned long long)reclaimable, active_slot, destination,
+          victim);
 
-out_free:
-   free_gc_moves(&moves);
+out_error:
    if (ret)
       DMERR("gc failed: %d", ret);
    return ret;
+}
+
+static int select_compaction_gc_target(struct zns_m1_c *c, u32 *victim,
+                       u32 *destination, u64 *victim_age,
+                       u64 *victim_score)
+{
+   sector_t max_remaining = 0;
+   u32 best_slot = 0;
+   u32 i;
+   int ret;
+
+   for (i = 0; i < c->nr_active_zones; i++) {
+      u32 zone_idx = c->active_zones[i];
+      struct zone_state *zone = &c->zones[zone_idx];
+      sector_t remaining = zone->capacity - zone->wp;
+
+      if (remaining > max_remaining) {
+         max_remaining = remaining;
+         best_slot = i;
+      }
+   }
+
+   if (!max_remaining)
+      return -ENOSPC;
+
+   ret = select_gc_victim(c, victim, victim_age, victim_score,
+              max_remaining);
+   if (ret)
+      return ret;
+
+   *destination = c->active_zones[best_slot];
+   return 0;
+}
+
+static int run_compaction_gc(struct zns_m1_c *c)
+{
+   u64 moved_sectors = 0;
+   u64 reclaimable;
+   u64 victim_age;
+   u64 victim_score;
+   u32 destination;
+   u32 victim;
+   int ret;
+
+   mutex_lock(&c->lock);
+   if (c->stopping) {
+      mutex_unlock(&c->lock);
+      return -ESHUTDOWN;
+   }
+   if (c->nr_free_zones > c->nr_active_zones) {
+      mutex_unlock(&c->lock);
+      return -EAGAIN;
+   }
+
+   ret = select_compaction_gc_target(c, &victim, &destination,
+                      &victim_age, &victim_score);
+   if (ret) {
+      mutex_unlock(&c->lock);
+      return ret;
+   }
+   reclaimable = c->zones[victim].invalid_sectors;
+   moved_sectors = c->zones[victim].valid_sectors;
+   mutex_unlock(&c->lock);
+
+   DMINFO("compaction gc start: policy=%s victim=%u destination=%u valid=%llu invalid=%llu age=%llu score=%llu",
+          gc_policy_name(c->gc_policy), victim, destination,
+          (unsigned long long)moved_sectors,
+          (unsigned long long)reclaimable,
+          (unsigned long long)victim_age,
+          (unsigned long long)victim_score);
+
+   ret = relocate_victim(c, c->ti, victim, destination, &moved_sectors);
+   if (ret)
+      goto out_error;
+
+   ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
+               c->ti->begin + (sector_t)victim * c->zone_size,
+               c->zone_size, GFP_NOIO);
+   if (ret)
+      goto out_error;
+
+   mutex_lock(&c->lock);
+   c->zones[victim].wp = 0;
+   c->zones[victim].valid_sectors = 0;
+   c->zones[victim].invalid_sectors = 0;
+   c->zones[victim].last_modified_generation = 0;
+   ret = push_free_zone(c, victim);
+   if (!ret) {
+      c->gc_count++;
+      c->compaction_gc_count++;
+      c->gc_moved_sectors += moved_sectors;
+      c->gc_reclaimed_sectors += reclaimable;
+   }
+   mutex_unlock(&c->lock);
+   if (ret)
+      goto out_error;
+
+   DMINFO("compaction gc complete: victim=%u destination=%u moved=%llu reclaimed=%llu free=%u",
+          victim, destination, (unsigned long long)moved_sectors,
+          (unsigned long long)reclaimable, c->nr_free_zones);
+   return 0;
+
+out_error:
+   DMERR("compaction gc failed: %d", ret);
+   return ret;
+}
+
+static void compaction_gc_workfn(struct work_struct *work)
+{
+   struct zns_m1_c *c = container_of(work, struct zns_m1_c,
+                 compaction_gc_work);
+   int ret;
+
+   ret = run_compaction_gc(c);
+   if (ret == -ENOSPC || ret == -EAGAIN || ret == -ESHUTDOWN)
+      return;
 }
 
 static int submit_clone_wait(struct zns_m1_c *c, struct bio *bio,
@@ -828,27 +1142,24 @@ static int process_write(struct zns_io_work *io)
    struct bio *bio = io->bio;
    struct zone_state *az;
    sector_t physical;
+   u32 active_slot;
    u32 zone_idx;
    int ret;
 
    mutex_lock(&c->lock);
-   az = &c->zones[c->active_zone];
-   if (az->wp + MAP_GRANULARITY_SECTORS > az->capacity) {
-      az->is_full = true;
-      ret = advance_active_zone(c);
+   ret = prepare_active_zone(c, bio->bi_iter.bi_sector, &active_slot);
+   if (ret) {
+      mutex_unlock(&c->lock);
+      ret = run_zone_gc(c, io->ti, active_slot);
       if (ret) {
-         mutex_unlock(&c->lock);
-         ret = run_greedy_gc(c, io->ti);
-         if (ret) {
-            DMERR("device full and GC could not reclaim a zone");
-            return ret;
-         }
-         mutex_lock(&c->lock);
+         DMERR("device full and GC could not reclaim a zone");
+         return ret;
       }
-      az = &c->zones[c->active_zone];
+      mutex_lock(&c->lock);
    }
 
-   zone_idx = c->active_zone;
+   zone_idx = c->active_zones[active_slot];
+   az = &c->zones[zone_idx];
    physical = io->ti->begin + (sector_t)zone_idx * c->zone_size + az->wp;
    mutex_unlock(&c->lock);
 
@@ -863,6 +1174,7 @@ static int process_write(struct zns_io_work *io)
    mutex_lock(&c->lock);
    az = &c->zones[zone_idx];
    az->wp += MAP_GRANULARITY_SECTORS;
+   az->last_modified_generation = ++c->write_generation;
    ret = map_insert(c, bio->bi_iter.bi_sector, zone_idx,
           az->wp - MAP_GRANULARITY_SECTORS, false);
    if (ret)
@@ -938,11 +1250,23 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
       ti->error = "out of memory";
       return -ENOMEM;
    }
+   c->ti = ti;
+
+   if (!strcmp(gc_policy, "greedy"))
+      c->gc_policy = GC_POLICY_GREEDY;
+   else if (!strcmp(gc_policy, "cost-benefit"))
+      c->gc_policy = GC_POLICY_COST_BENEFIT;
+   else {
+      ti->error = "gc_policy must be greedy or cost-benefit";
+      ret = -EINVAL;
+      goto err_free;
+   }
 
    mutex_init(&c->lock);
    c->active_memtable = RB_ROOT;
    INIT_LIST_HEAD(&c->runs);
    INIT_WORK(&c->compaction_work, compact_runs);
+   INIT_WORK(&c->compaction_gc_work, compaction_gc_workfn);
    c->compaction_wq = alloc_ordered_workqueue("zns_lsm_compact",
                     WQ_MEM_RECLAIM);
    if (!c->compaction_wq) {
@@ -1000,6 +1324,16 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
       goto err_put;
    }
 
+   c->active_zones = kcalloc(c->nr_zones, sizeof(*c->active_zones),
+                   GFP_KERNEL);
+   c->free_zones = kcalloc(c->nr_zones, sizeof(*c->free_zones),
+                GFP_KERNEL);
+   if (!c->active_zones || !c->free_zones) {
+      ti->error = "out of memory for zone pools";
+      ret = -ENOMEM;
+      goto err_zone_pools;
+   }
+
    nr_rep = c->nr_zones;
    ret = blkdev_report_zones(bdev, ti->begin, nr_rep, fill_zone_cb, c);
    if (ret < 0) {
@@ -1007,9 +1341,9 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
       goto err_zones;
    }
 
-   ret = find_initial_zones(c);
+   ret = initialize_zone_pool(c, bdev);
    if (ret) {
-      ti->error = "need one active zone and one empty reserve zone";
+      ti->error = "not enough empty zones for active pool and reserve";
       goto err_zones;
    }
 
@@ -1033,11 +1367,15 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
    ti->discards_supported = true;
    ti->max_write_zeroes_granularity = true;
 
-   DMINFO("ctr: target attached on '%s' (%u zones, active=%u reserve=%u)",
-          argv[0], c->nr_zones, c->active_zone, c->reserve_zone);
+   DMINFO("ctr: target attached on '%s' (%u zones, active_pool=%u reserve=%u free=%u gc=%s)",
+          argv[0], c->nr_zones, c->nr_active_zones, c->reserve_zone,
+          c->nr_free_zones, gc_policy_name(c->gc_policy));
    return 0;
 
 err_zones:
+err_zone_pools:
+   kfree(c->free_zones);
+   kfree(c->active_zones);
    kfree(c->zones);
 err_put:
    dm_put_device(ti, c->dev);
@@ -1058,13 +1396,20 @@ static void zns_m1_dtr(struct dm_target *ti)
    struct sorted_run *run;
    struct sorted_run *tmp;
 
-   destroy_workqueue(c->io_wq);
-
    mutex_lock(&c->lock);
    c->stopping = true;
    mutex_unlock(&c->lock);
    cancel_work_sync(&c->compaction_work);
    destroy_workqueue(c->compaction_wq);
+   destroy_workqueue(c->io_wq);
+
+   DMINFO("gc summary: policy=%s cycles=%llu compaction_cycles=%llu moved=%llu reclaimed=%llu",
+          gc_policy_name(c->gc_policy),
+          (unsigned long long)c->gc_count,
+          (unsigned long long)c->compaction_gc_count,
+          (unsigned long long)c->gc_moved_sectors,
+          (unsigned long long)c->gc_reclaimed_sectors);
+
    bioset_exit(&c->clone_bioset);
 
    free_tree(&c->active_memtable);
@@ -1074,6 +1419,8 @@ static void zns_m1_dtr(struct dm_target *ti)
    }
 
    kfree(c->zones);
+   kfree(c->free_zones);
+   kfree(c->active_zones);
    dm_put_device(ti, c->dev);
    kfree(c);
    DMINFO("dtr: target detached");
@@ -1140,7 +1487,7 @@ static int zns_m1_iterate_devices(struct dm_target *ti,
 
 static struct target_type zns_m1_target = {
    .name = "zns-m1",
-   .version = { 0, 5, 0 },
+   .version = { 0, 8, 0 },
    .features = 0,
    .module = THIS_MODULE,
    .ctr = zns_m1_ctr,
@@ -1171,6 +1518,6 @@ static void __exit zns_m1_exit(void)
 module_init(zns_m1_init);
 module_exit(zns_m1_exit);
 
-MODULE_DESCRIPTION("ZNS M1-M3: in-memory LSM mapping with greedy zone GC");
+MODULE_DESCRIPTION("ZNS M1-M3: LSM compaction-coupled GC and active zone pool");
 MODULE_AUTHOR("SPLAB");
 MODULE_LICENSE("GPL");
