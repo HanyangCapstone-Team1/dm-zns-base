@@ -19,6 +19,7 @@
 #include <linux/workqueue.h>
 #include <linux/mm.h>
 #include <linux/math64.h>
+#include <linux/version.h>
 
 #define DM_MSG_PREFIX "zns-m1"
 #define MAP_BLOCK_SIZE 4096
@@ -126,6 +127,49 @@ struct zns_m1_c {
    struct bio_set clone_bioset;
    struct mutex lock;
 };
+
+/* Linux 5.15와 최신 커널의 block API 차이를 여기서 처리함. */
+static struct bio *zns_bio_alloc(struct zns_m1_c *c,
+                 unsigned short nr_vecs,
+                 unsigned int opf, gfp_t gfp)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
+   struct bio *bio;
+
+   bio = bio_alloc(gfp, nr_vecs);
+   if (!bio)
+      return NULL;
+
+   bio_set_dev(bio, c->dev->bdev);
+   bio->bi_opf = opf;
+   return bio;
+#else
+   return bio_alloc(c->dev->bdev, nr_vecs, opf, gfp);
+#endif
+}
+
+static struct bio *zns_bio_clone(struct zns_m1_c *c, struct bio *source,
+                 gfp_t gfp)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
+   struct bio *clone;
+
+   clone = bio_clone_fast(source, gfp, &c->clone_bioset);
+   if (clone)
+      bio_set_dev(clone, c->dev->bdev);
+   return clone;
+#else
+   return bio_alloc_clone(c->dev->bdev, source, gfp,
+               &c->clone_bioset);
+#endif
+}
+
+static int zns_reset_zone(struct zns_m1_c *c, sector_t sector,
+              sector_t nr_sectors)
+{
+   return blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET, sector,
+               nr_sectors, GFP_NOIO);
+}
 
 static struct map_entry *tree_lookup(struct rb_root *root,
                  sector_t logical_sector)
@@ -752,12 +796,12 @@ static int collect_gc_moves(struct zns_m1_c *c, u32 victim,
 }
 
 static int submit_page_wait(struct zns_m1_c *c, struct page *page,
-               sector_t physical_sector, enum req_op op)
+               sector_t physical_sector, unsigned int op)
 {
    struct bio *bio;
    int ret;
 
-   bio = bio_alloc(c->dev->bdev, 1, op | REQ_SYNC, GFP_NOIO);
+   bio = zns_bio_alloc(c, 1, op | REQ_SYNC, GFP_NOIO);
    if (!bio)
       return -ENOMEM;
 
@@ -912,9 +956,9 @@ static int run_zone_gc(struct zns_m1_c *c, struct dm_target *ti,
    if (ret)
       goto out_error;
 
-   ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
-               ti->begin + (sector_t)victim * c->zone_size,
-               c->zone_size, GFP_NOIO);
+   ret = zns_reset_zone(c,
+              ti->begin + (sector_t)victim * c->zone_size,
+              c->zone_size);
    if (ret)
       goto out_error;
 
@@ -1018,9 +1062,9 @@ static int run_compaction_gc(struct zns_m1_c *c)
    if (ret)
       goto out_error;
 
-   ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
-               c->ti->begin + (sector_t)victim * c->zone_size,
-               c->zone_size, GFP_NOIO);
+   ret = zns_reset_zone(c,
+              c->ti->begin + (sector_t)victim * c->zone_size,
+              c->zone_size);
    if (ret)
       goto out_error;
 
@@ -1067,8 +1111,7 @@ static int submit_clone_wait(struct zns_m1_c *c, struct bio *bio,
    struct bio *clone;
    int ret;
 
-   clone = bio_alloc_clone(c->dev->bdev, bio, GFP_NOIO,
-            &c->clone_bioset);
+   clone = zns_bio_clone(c, bio, GFP_NOIO);
    if (!clone)
       return -ENOMEM;
 
@@ -1087,7 +1130,7 @@ static int submit_zero_write_wait(struct zns_m1_c *c, struct bio *orig,
    unsigned int bytes = MAP_GRANULARITY_SECTORS << SECTOR_SHIFT;
    int ret;
 
-   write_bio = bio_alloc(c->dev->bdev, 1, REQ_OP_WRITE, GFP_NOIO);
+   write_bio = zns_bio_alloc(c, 1, REQ_OP_WRITE, GFP_NOIO);
    if (!write_bio)
       return -ENOMEM;
 
@@ -1365,7 +1408,9 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
    ti->per_io_data_size = sizeof(struct zns_io_work);
    ti->flush_supported = true;
    ti->discards_supported = true;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
    ti->max_write_zeroes_granularity = true;
+#endif
 
    DMINFO("ctr: target attached on '%s' (%u zones, active_pool=%u reserve=%u free=%u gc=%s)",
           argv[0], c->nr_zones, c->nr_active_zones, c->reserve_zone,
