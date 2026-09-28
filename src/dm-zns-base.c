@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * dm-zns-base: M1/M2 임의 쓰기 변환 테스트용 코드
+ * dm-zns-base: M1/M2 임의 쓰기 변환 및 M3 GC 테스트용 코드
  *
  * 상위에서는 일반 블록 장치로 보이게 했음.
  * 쓰기는 active zone의 wp에 순서대로 저장하고 논리 주소와 실제 저장
@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <linux/mm.h>
+#include <linux/math64.h>
 
 #define DM_MSG_PREFIX "zns-m1"
 #define MAP_BLOCK_SIZE 4096
@@ -30,9 +31,17 @@
 struct zone_state {
    sector_t wp;
    sector_t capacity;
+   u64 valid_sectors;
    u64 invalid_sectors;
    bool is_active;
    bool is_full;
+};
+
+struct gc_move {
+   sector_t logical_sector;
+   sector_t source_offset;
+   u64 sequence;
+   struct list_head list;
 };
 
 struct map_entry {
@@ -69,6 +78,10 @@ struct zns_m1_c {
    sector_t zone_size;
    struct zone_state *zones;
    u32 active_zone;
+   u32 reserve_zone;
+   u64 gc_count;
+   u64 gc_moved_sectors;
+   u64 gc_reclaimed_sectors;
    struct rb_root active_memtable;
    u32 active_entries;
    u64 next_sequence;
@@ -260,8 +273,16 @@ static int map_insert(struct zns_m1_c *c, sector_t logical, u32 zone_idx,
       return ret;
 
    if (old_mapping_valid)
-      c->zones[old_zone_idx].invalid_sectors +=
-         MAP_GRANULARITY_SECTORS;
+      if (c->zones[old_zone_idx].valid_sectors >=
+          MAP_GRANULARITY_SECTORS) {
+         c->zones[old_zone_idx].valid_sectors -=
+            MAP_GRANULARITY_SECTORS;
+         c->zones[old_zone_idx].invalid_sectors +=
+            MAP_GRANULARITY_SECTORS;
+      }
+
+   if (!tombstone)
+      c->zones[zone_idx].valid_sectors += MAP_GRANULARITY_SECTORS;
 
    if (ret > 0)
       c->active_entries++;
@@ -275,6 +296,8 @@ static int advance_active_zone(struct zns_m1_c *c)
    u32 i;
 
    for (i = 0; i < c->nr_zones; i++) {
+      if (i == c->reserve_zone)
+         continue;
       if (!c->zones[i].is_full && !c->zones[i].is_active &&
           c->zones[i].wp == 0) {
          c->zones[c->active_zone].is_active = false;
@@ -297,23 +320,33 @@ static int fill_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
 
    c->zones[idx].capacity = zone->capacity;
    c->zones[idx].wp = zone->wp - zone->start;
+   c->zones[idx].valid_sectors = 0;
    c->zones[idx].invalid_sectors = 0;
    c->zones[idx].is_full = zone->cond == BLK_ZONE_COND_FULL;
    c->zones[idx].is_active = false;
    return 0;
 }
 
-static int find_initial_active_zone(struct zns_m1_c *c)
+static int find_initial_zones(struct zns_m1_c *c)
 {
    u32 i;
+   bool active_found = false;
 
    for (i = 0; i < c->nr_zones; i++) {
       if (!c->zones[i].is_full &&
           c->zones[i].wp < c->zones[i].capacity &&
           IS_ALIGNED(c->zones[i].wp, MAP_GRANULARITY_SECTORS)) {
-         c->active_zone = i;
-         c->zones[i].is_active = true;
-         return 0;
+         if (!active_found) {
+            c->active_zone = i;
+            c->zones[i].is_active = true;
+            active_found = true;
+            continue;
+         }
+
+         if (c->zones[i].wp == 0) {
+            c->reserve_zone = i;
+            return 0;
+         }
       }
    }
 
@@ -453,6 +486,267 @@ failed:
    }
 }
 
+static int select_greedy_victim(struct zns_m1_c *c, u32 *victim)
+{
+   u64 best_invalid = 0;
+   sector_t best_used = 1;
+   u32 i;
+   bool found = false;
+
+   for (i = 0; i < c->nr_zones; i++) {
+      struct zone_state *zone = &c->zones[i];
+
+      if (i == c->active_zone || i == c->reserve_zone || !zone->wp ||
+          !zone->invalid_sectors)
+         continue;
+      if (zone->valid_sectors + MAP_GRANULARITY_SECTORS >
+          c->zones[c->reserve_zone].capacity)
+         continue;
+
+      if (!found ||
+          zone->invalid_sectors * (u64)best_used >
+          best_invalid * (u64)zone->wp) {
+         *victim = i;
+         best_invalid = zone->invalid_sectors;
+         best_used = zone->wp;
+         found = true;
+      }
+   }
+
+   return found ? 0 : -ENOSPC;
+}
+
+static int collect_tree_gc_moves(struct zns_m1_c *c, struct rb_root *root,
+                  u32 victim, struct list_head *moves,
+                  u64 *nr_moves)
+{
+   struct rb_node *node;
+
+   for (node = rb_first(root); node; node = rb_next(node)) {
+      struct map_entry *entry = rb_entry(node, struct map_entry, node);
+      struct map_entry *latest;
+      struct gc_move *move;
+
+      if (entry->tombstone || entry->zone_idx != victim)
+         continue;
+
+      latest = map_lookup(c, entry->logical_sector);
+      if (latest != entry)
+         continue;
+
+      move = kmalloc(sizeof(*move), GFP_KERNEL);
+      if (!move)
+         return -ENOMEM;
+
+      move->logical_sector = entry->logical_sector;
+      move->source_offset = entry->zone_offset;
+      move->sequence = entry->sequence;
+      list_add_tail(&move->list, moves);
+      (*nr_moves)++;
+   }
+
+   return 0;
+}
+
+static void free_gc_moves(struct list_head *moves)
+{
+   struct gc_move *move;
+   struct gc_move *tmp;
+
+   list_for_each_entry_safe(move, tmp, moves, list) {
+      list_del(&move->list);
+      kfree(move);
+   }
+}
+
+static int collect_gc_moves(struct zns_m1_c *c, u32 victim,
+               struct list_head *moves, u64 *nr_moves)
+{
+   struct sorted_run *run;
+   int ret;
+
+   ret = collect_tree_gc_moves(c, &c->active_memtable, victim, moves,
+                nr_moves);
+   if (ret)
+      return ret;
+
+   list_for_each_entry(run, &c->runs, list) {
+      ret = collect_tree_gc_moves(c, &run->root, victim, moves,
+                   nr_moves);
+      if (ret)
+         return ret;
+   }
+
+   return 0;
+}
+
+static int submit_page_wait(struct zns_m1_c *c, struct page *page,
+               sector_t physical_sector, enum req_op op)
+{
+   struct bio *bio;
+   int ret;
+
+   bio = bio_alloc(c->dev->bdev, 1, op | REQ_SYNC, GFP_NOIO);
+   if (!bio)
+      return -ENOMEM;
+
+   bio->bi_iter.bi_sector = physical_sector;
+   if (bio_add_page(bio, page, MAP_BLOCK_SIZE, 0) != MAP_BLOCK_SIZE) {
+      bio_put(bio);
+      return -EIO;
+   }
+
+   ret = submit_bio_wait(bio);
+   bio_put(bio);
+   return ret;
+}
+
+static int copy_gc_block(struct zns_m1_c *c, sector_t source,
+             sector_t destination)
+{
+   struct page *page;
+   int ret;
+
+   page = alloc_page(GFP_NOIO);
+   if (!page)
+      return -ENOMEM;
+
+   ret = submit_page_wait(c, page, source, REQ_OP_READ);
+   if (!ret)
+      ret = submit_page_wait(c, page, destination, REQ_OP_WRITE);
+
+   __free_page(page);
+   return ret;
+}
+
+static int run_greedy_gc(struct zns_m1_c *c, struct dm_target *ti)
+{
+   LIST_HEAD(moves);
+   struct gc_move *move;
+   u64 nr_moves = 0;
+   u64 moved_sectors = 0;
+   u64 reclaimable;
+   u32 victim;
+   u32 destination;
+   int ret;
+
+   mutex_lock(&c->lock);
+   ret = select_greedy_victim(c, &victim);
+   if (ret) {
+      mutex_unlock(&c->lock);
+      return ret;
+   }
+
+   destination = c->reserve_zone;
+   if (c->zones[destination].wp != 0) {
+      mutex_unlock(&c->lock);
+      return -ENOSPC;
+   }
+
+   reclaimable = c->zones[victim].invalid_sectors;
+   ret = collect_gc_moves(c, victim, &moves, &nr_moves);
+   if (!ret && nr_moves * MAP_GRANULARITY_SECTORS !=
+       c->zones[victim].valid_sectors)
+      ret = -EUCLEAN;
+   mutex_unlock(&c->lock);
+   if (ret)
+      goto out_free;
+
+   DMINFO("gc start: victim=%u destination=%u valid=%llu invalid=%llu",
+          victim, destination,
+          (unsigned long long)(nr_moves * MAP_GRANULARITY_SECTORS),
+          (unsigned long long)reclaimable);
+
+   list_for_each_entry(move, &moves, list) {
+      struct map_entry *latest;
+      sector_t source;
+      sector_t destination_sector;
+      sector_t destination_offset;
+
+      mutex_lock(&c->lock);
+      destination_offset = c->zones[destination].wp;
+      if (destination_offset + MAP_GRANULARITY_SECTORS >
+          c->zones[destination].capacity) {
+         mutex_unlock(&c->lock);
+         ret = -ENOSPC;
+         goto out_free;
+      }
+      source = ti->begin + (sector_t)victim * c->zone_size +
+         move->source_offset;
+      destination_sector = ti->begin +
+         (sector_t)destination * c->zone_size + destination_offset;
+      mutex_unlock(&c->lock);
+
+      ret = copy_gc_block(c, source, destination_sector);
+      if (ret)
+         goto out_free;
+
+      mutex_lock(&c->lock);
+      c->zones[destination].wp += MAP_GRANULARITY_SECTORS;
+      latest = map_lookup(c, move->logical_sector);
+      if (!latest || latest->tombstone || latest->sequence != move->sequence ||
+          latest->zone_idx != victim ||
+          latest->zone_offset != move->source_offset) {
+         c->zones[destination].invalid_sectors +=
+            MAP_GRANULARITY_SECTORS;
+         mutex_unlock(&c->lock);
+         continue;
+      }
+
+      ret = map_insert(c, move->logical_sector, destination,
+             destination_offset, false);
+      if (ret)
+         c->zones[destination].invalid_sectors +=
+            MAP_GRANULARITY_SECTORS;
+      else
+         moved_sectors += MAP_GRANULARITY_SECTORS;
+      mutex_unlock(&c->lock);
+      if (ret)
+         goto out_free;
+   }
+
+   mutex_lock(&c->lock);
+   if (c->zones[victim].valid_sectors) {
+      mutex_unlock(&c->lock);
+      ret = -EUCLEAN;
+      goto out_free;
+   }
+   mutex_unlock(&c->lock);
+
+   ret = blkdev_zone_mgmt(c->dev->bdev, REQ_OP_ZONE_RESET,
+               ti->begin + (sector_t)victim * c->zone_size,
+               c->zone_size, GFP_NOIO);
+   if (ret)
+      goto out_free;
+
+   mutex_lock(&c->lock);
+   c->zones[c->active_zone].is_active = false;
+   c->zones[victim].wp = 0;
+   c->zones[victim].valid_sectors = 0;
+   c->zones[victim].invalid_sectors = 0;
+   c->zones[victim].is_full = false;
+   c->zones[victim].is_active = false;
+   c->active_zone = destination;
+   c->zones[destination].is_active = true;
+   c->zones[destination].is_full =
+      c->zones[destination].wp >= c->zones[destination].capacity;
+   c->reserve_zone = victim;
+   c->gc_count++;
+   c->gc_moved_sectors += moved_sectors;
+   c->gc_reclaimed_sectors += reclaimable;
+   mutex_unlock(&c->lock);
+
+   DMINFO("gc complete: victim=%u moved=%llu reclaimed=%llu reserve=%u",
+          victim, (unsigned long long)moved_sectors,
+          (unsigned long long)reclaimable, victim);
+
+out_free:
+   free_gc_moves(&moves);
+   if (ret)
+      DMERR("gc failed: %d", ret);
+   return ret;
+}
+
 static int submit_clone_wait(struct zns_m1_c *c, struct bio *bio,
               sector_t physical_sector, bool remap_sector)
 {
@@ -544,8 +838,12 @@ static int process_write(struct zns_io_work *io)
       ret = advance_active_zone(c);
       if (ret) {
          mutex_unlock(&c->lock);
-         DMERR("device full, no free zones");
-         return ret;
+         ret = run_greedy_gc(c, io->ti);
+         if (ret) {
+            DMERR("device full and GC could not reclaim a zone");
+            return ret;
+         }
+         mutex_lock(&c->lock);
       }
       az = &c->zones[c->active_zone];
    }
@@ -567,6 +865,8 @@ static int process_write(struct zns_io_work *io)
    az->wp += MAP_GRANULARITY_SECTORS;
    ret = map_insert(c, bio->bi_iter.bi_sector, zone_idx,
           az->wp - MAP_GRANULARITY_SECTORS, false);
+   if (ret)
+      az->invalid_sectors += MAP_GRANULARITY_SECTORS;
    mutex_unlock(&c->lock);
    return ret;
 }
@@ -707,9 +1007,9 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
       goto err_zones;
    }
 
-   ret = find_initial_active_zone(c);
+   ret = find_initial_zones(c);
    if (ret) {
-      ti->error = "no writable zone";
+      ti->error = "need one active zone and one empty reserve zone";
       goto err_zones;
    }
 
@@ -733,8 +1033,8 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
    ti->discards_supported = true;
    ti->max_write_zeroes_granularity = true;
 
-   DMINFO("ctr: target attached on top of '%s' (%u zones, %llu sectors/zone)",
-          argv[0], c->nr_zones, (unsigned long long)c->zone_size);
+   DMINFO("ctr: target attached on '%s' (%u zones, active=%u reserve=%u)",
+          argv[0], c->nr_zones, c->active_zone, c->reserve_zone);
    return 0;
 
 err_zones:
@@ -840,7 +1140,7 @@ static int zns_m1_iterate_devices(struct dm_target *ti,
 
 static struct target_type zns_m1_target = {
    .name = "zns-m1",
-   .version = { 0, 4, 0 },
+   .version = { 0, 5, 0 },
    .features = 0,
    .module = THIS_MODULE,
    .ctr = zns_m1_ctr,
@@ -871,6 +1171,6 @@ static void __exit zns_m1_exit(void)
 module_init(zns_m1_init);
 module_exit(zns_m1_exit);
 
-MODULE_DESCRIPTION("ZNS M1/M2: in-memory LSM mapping DM target");
+MODULE_DESCRIPTION("ZNS M1-M3: in-memory LSM mapping with greedy zone GC");
 MODULE_AUTHOR("SPLAB");
 MODULE_LICENSE("GPL");
