@@ -44,6 +44,12 @@ static unsigned int active_zone_pool_size = DEFAULT_ACTIVE_ZONE_POOL_SIZE;
 module_param(active_zone_pool_size, uint, 0444);
 MODULE_PARM_DESC(active_zone_pool_size, "Number of zones in the active write pool");
 
+/* Only proactive compaction GC uses this threshold; 0 restores baseline. */
+static unsigned int compaction_gc_min_invalid_percent = 20;
+module_param(compaction_gc_min_invalid_percent, uint, 0444);
+MODULE_PARM_DESC(compaction_gc_min_invalid_percent,
+                "Minimum invalid percentage for compaction GC (0-100)");
+
 enum zone_role {
    ZONE_ROLE_CLOSED,
    ZONE_ROLE_FREE,
@@ -627,7 +633,7 @@ static const char *gc_policy_name(enum gc_policy_type policy)
 }
 
 static bool zone_is_gc_candidate(struct zns_m1_c *c, u32 zone_idx,
-                  u64 max_valid_sectors)
+                  u64 max_valid_sectors, unsigned int min_invalid_percent)
 {
    struct zone_state *zone = &c->zones[zone_idx];
 
@@ -635,12 +641,16 @@ static bool zone_is_gc_candidate(struct zns_m1_c *c, u32 zone_idx,
        !zone->invalid_sectors)
       return false;
 
+   if (mul_u64_u64_div_u64(zone->invalid_sectors, 100, zone->wp) <
+       min_invalid_percent)
+      return false;
+
    return zone->valid_sectors <= max_valid_sectors;
 }
 
 static int select_greedy_victim(struct zns_m1_c *c, u32 *victim,
                  u64 *victim_age, u64 *victim_score,
-                 u64 max_valid_sectors)
+                 u64 max_valid_sectors, unsigned int min_invalid_percent)
 {
    u64 best_invalid = 0;
    sector_t best_used = 1;
@@ -650,7 +660,8 @@ static int select_greedy_victim(struct zns_m1_c *c, u32 *victim,
    for (i = 0; i < c->nr_zones; i++) {
       struct zone_state *zone = &c->zones[i];
 
-      if (!zone_is_gc_candidate(c, i, max_valid_sectors))
+      if (!zone_is_gc_candidate(c, i, max_valid_sectors,
+                                min_invalid_percent))
          continue;
 
       if (!found ||
@@ -675,7 +686,7 @@ static int select_greedy_victim(struct zns_m1_c *c, u32 *victim,
 
 static int select_cost_benefit_victim(struct zns_m1_c *c, u32 *victim,
                       u64 *victim_age, u64 *victim_score,
-                      u64 max_valid_sectors)
+                      u64 max_valid_sectors, unsigned int min_invalid_percent)
 {
    u64 best_score = 0;
    u64 best_age = 0;
@@ -690,7 +701,8 @@ static int select_cost_benefit_victim(struct zns_m1_c *c, u32 *victim,
       u64 score;
       u64 age;
 
-      if (!zone_is_gc_candidate(c, i, max_valid_sectors))
+      if (!zone_is_gc_candidate(c, i, max_valid_sectors,
+                                min_invalid_percent))
          continue;
 
       age = c->write_generation - zone->last_modified_generation;
@@ -721,14 +733,15 @@ static int select_cost_benefit_victim(struct zns_m1_c *c, u32 *victim,
 
 static int select_gc_victim(struct zns_m1_c *c, u32 *victim,
                u64 *victim_age, u64 *victim_score,
-               u64 max_valid_sectors)
+               u64 max_valid_sectors, unsigned int min_invalid_percent)
 {
    if (c->gc_policy == GC_POLICY_COST_BENEFIT)
       return select_cost_benefit_victim(c, victim, victim_age,
-                         victim_score, max_valid_sectors);
+                         victim_score, max_valid_sectors,
+                         min_invalid_percent);
 
    return select_greedy_victim(c, victim, victim_age, victim_score,
-                    max_valid_sectors);
+                    max_valid_sectors, min_invalid_percent);
 }
 
 static int collect_tree_gc_moves(struct zns_m1_c *c, struct rb_root *root,
@@ -929,7 +942,7 @@ static int run_zone_gc(struct zns_m1_c *c, struct dm_target *ti,
    old_active = c->active_zones[active_slot];
    ret = select_gc_victim(c, &victim, &victim_age, &victim_score,
               c->zones[c->reserve_zone].capacity -
-              MAP_GRANULARITY_SECTORS);
+              MAP_GRANULARITY_SECTORS, 0);
    if (ret) {
       mutex_unlock(&c->lock);
       return ret;
@@ -1013,7 +1026,7 @@ static int select_compaction_gc_target(struct zns_m1_c *c, u32 *victim,
       return -ENOSPC;
 
    ret = select_gc_victim(c, victim, victim_age, victim_score,
-              max_remaining);
+              max_remaining, compaction_gc_min_invalid_percent);
    if (ret)
       return ret;
 
@@ -1288,6 +1301,11 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
       return -EINVAL;
    }
 
+   if (compaction_gc_min_invalid_percent > 100) {
+      ti->error = "compaction_gc_min_invalid_percent must be 0-100";
+      return -EINVAL;
+   }
+
    c = kzalloc(sizeof(*c), GFP_KERNEL);
    if (!c) {
       ti->error = "out of memory";
@@ -1532,7 +1550,7 @@ static int zns_m1_iterate_devices(struct dm_target *ti,
 
 static struct target_type zns_m1_target = {
    .name = "zns-m1",
-   .version = { 0, 8, 0 },
+   .version = { 0, 8, 1 },
    .features = 0,
    .module = THIS_MODULE,
    .ctr = zns_m1_ctr,

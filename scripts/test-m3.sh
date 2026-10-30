@@ -18,6 +18,7 @@ SRC_DIR=$(cd "$SCRIPT_DIR/../src" && pwd)
 KO_PATH="$SRC_DIR/$MOD_NAME.ko"
 
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
+source "$SCRIPT_DIR/test-kernel-log.sh"
 
 case "$GC_POLICY" in
 	greedy|cost-benefit) ;;
@@ -29,6 +30,7 @@ case "$ACTIVE_ZONE_POOL_SIZE" in
 esac
 
 cleanup() {
+	kernel_log_abort
 	dmsetup remove "$DM_NAME" 2>/dev/null || true
 	rmmod "$MOD_NAME" 2>/dev/null || true
 }
@@ -39,7 +41,7 @@ trap cleanup EXIT
 	exit 1
 }
 
-for cmd in fio dmsetup blkzone blockdev; do
+for cmd in fio dmsetup blkzone blockdev python3 flock; do
 	command -v "$cmd" >/dev/null || {
 		echo "[FAIL] Required command is missing: $cmd" >&2
 		exit 1
@@ -54,6 +56,7 @@ rmmod "$MOD_NAME" 2>/dev/null || true
 
 echo "[*] Resetting all zones on $UNDERLYING"
 blkzone reset "$UNDERLYING"
+kernel_log_start
 
 echo "[*] Loading $KO_PATH (GC policy: $GC_POLICY, active pool: $ACTIVE_ZONE_POOL_SIZE)"
 insmod "$KO_PATH" gc_policy="$GC_POLICY" \
@@ -61,14 +64,6 @@ insmod "$KO_PATH" gc_policy="$GC_POLICY" \
 
 device_sectors=$(blockdev --getsz "$UNDERLYING")
 echo "0 $device_sectors $TARGET_NAME $UNDERLYING" | dmsetup create "$DM_NAME"
-
-pool_log=$(dmesg | grep 'zns-m1: active pool initialized:' | tail -n 1 || true)
-if [ -z "$pool_log" ]; then
-	echo "[FAIL] active zone pool initialization was not observed" >&2
-	exit 2
-fi
-echo "[*] $pool_log"
-before_pool_replacements=$(dmesg | grep -c 'zns-m1: active pool replace:' || true)
 
 dm_base=$(basename "$(readlink -f "$DM_DEV")")
 zoned=$(cat "/sys/block/$dm_base/queue/zoned")
@@ -84,10 +79,6 @@ verify_bytes=$((64 * 1024 * 1024))
 if [ "$verify_bytes" -gt "$range_bytes" ]; then
 	verify_bytes=$range_bytes
 fi
-
-before_gc=$(dmesg | grep -Ec 'zns-m1: (compaction )?gc complete:' || true)
-before_compaction_gc=$(dmesg | grep -c 'zns-m1: compaction gc complete:' || true)
-before_errors=$(dmesg | grep -Ec 'blk_update_request|I/O error' || true)
 
 echo "[*] Filling 80% of the logical device with unique random writes"
 fio --name=m3-fill --filename="$DM_DEV" --rw=randwrite \
@@ -106,31 +97,35 @@ fio --name=m3-verify --filename="$DM_DEV" --rw=randwrite \
 	--direct=1 --verify=crc32c --verify_fatal=1 --do_verify=1 \
 	--randrepeat=1 --group_reporting
 
-after_gc=$(dmesg | grep -Ec 'zns-m1: (compaction )?gc complete:' || true)
-after_compaction_gc=$(dmesg | grep -c 'zns-m1: compaction gc complete:' || true)
-after_errors=$(dmesg | grep -Ec 'blk_update_request|I/O error' || true)
-after_pool_replacements=$(dmesg | grep -c 'zns-m1: active pool replace:' || true)
-gc_delta=$((after_gc - before_gc))
-compaction_gc_delta=$((after_compaction_gc - before_compaction_gc))
-error_delta=$((after_errors - before_errors))
-pool_replacement_delta=$((after_pool_replacements - before_pool_replacements))
+# Drain workers and capture teardown before ending this run's log interval.
+dmsetup remove "$DM_NAME"
+rmmod "$MOD_NAME"
+kernel_log_finish
+if ! grep -q 'zns-m1: active pool initialized:' "$KERNEL_LOG"; then
+    echo "[FAIL] active zone pool initialization was not observed" >&2
+    exit 2
+fi
+gc_delta=$(grep -Ec 'zns-m1: (compaction )?gc complete:' "$KERNEL_LOG" || true)
+compaction_gc_delta=$(grep -c 'zns-m1: compaction gc complete:' "$KERNEL_LOG" || true)
+pool_replacement_delta=$(grep -c 'zns-m1: active pool replace:' "$KERNEL_LOG" || true)
+error_delta=$(grep -Ec 'blk_update_request|I/O error|gc failed:|compaction failed:' "$KERNEL_LOG" || true)
 
 echo "    $GC_POLICY GC cycles: $gc_delta"
 echo "    LSM compaction-coupled GC cycles: $compaction_gc_delta"
 echo "    active pool replacements: $pool_replacement_delta"
-echo "    block I/O error delta: $error_delta"
+echo "    kernel I/O/GC/compaction errors: $error_delta"
 
-if [ "$pool_replacement_delta" -eq 0 ]; then
+if [ "$pool_replacement_delta" -le 0 ]; then
 	echo "[FAIL] no active zone was replaced from the free pool" >&2
 	exit 3
 fi
 
-if [ "$gc_delta" -eq 0 ]; then
+if [ "$gc_delta" -le 0 ]; then
 	echo "[FAIL] overwrite completed without an observed GC/reset cycle" >&2
 	exit 4
 fi
 
-if [ "$compaction_gc_delta" -eq 0 ]; then
+if [ "$compaction_gc_delta" -le 0 ]; then
 	echo "[FAIL] LSM compaction did not trigger physical zone GC" >&2
 	exit 5
 fi
