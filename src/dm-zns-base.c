@@ -224,6 +224,10 @@ static int tree_insert(struct rb_root *root, sector_t logical, u32 zone_idx,
       } else if (logical > e->logical_sector) {
          link = &parent->rb_right;
       } else {
+         /*
+          * 병합 시에는 더 최신 sequence만 남긴다. 일반 Memtable 갱신은
+          * 호출자가 새 sequence를 발급하므로 해당 키를 바로 교체한다.
+          */
          if (!replace_newer || sequence >= e->sequence) {
             e->zone_idx = zone_idx;
             e->zone_offset = zone_offset;
@@ -276,6 +280,10 @@ static struct map_entry *map_lookup(struct zns_m1_c *c,
    struct map_entry *best;
    struct sorted_run *run;
 
+   /*
+    * 같은 논리 주소가 여러 run에 남아 있을 수 있다. 목록 순서 대신
+    * sequence를 비교해야 최신 데이터 또는 최신 삭제 기록을 찾는다.
+    */
    best = tree_lookup(&c->active_memtable, logical_sector);
    list_for_each_entry(run, &c->runs, list) {
       struct map_entry *e = tree_lookup(&run->root, logical_sector);
@@ -335,6 +343,10 @@ static void rotate_memtable(struct zns_m1_c *c)
    if (!run)
       return;
 
+   /*
+    * 노드를 복사하지 않고 트리 소유권을 run으로 넘긴다. 새 쓰기는
+    * 빈 Memtable로 들어가므로 이후 병합 대상 run은 변경되지 않는다.
+    */
    run->root = c->active_memtable;
    run->nr_entries = c->active_entries;
    run->level = 0;
@@ -362,12 +374,20 @@ static int map_insert(struct zns_m1_c *c, sector_t logical, u32 zone_idx,
    bool old_mapping_valid = false;
    int ret;
 
+   /*
+    * tree_insert가 기존 Memtable 항목 자체를 바꿀 수 있으므로
+    * 이전 zone 번호를 먼저 저장해 두고 유효/무효 통계에 사용한다.
+    */
    old = map_lookup(c, logical);
    if (old && !old->tombstone && old->zone_idx < c->nr_zones) {
       old_zone_idx = old->zone_idx;
       old_mapping_valid = true;
    }
 
+   /*
+    * 메모리 할당 실패 시 이전 매핑과 zone 통계를 유지한다.
+    * 새 매핑 삽입이 성공한 뒤에만 이전 물리 블록을 무효로 계산한다.
+    */
    ret = tree_insert(&c->active_memtable, logical, zone_idx, zone_offset,
            ++c->next_sequence, tombstone, GFP_KERNEL, false);
    if (ret < 0)
@@ -382,6 +402,10 @@ static int map_insert(struct zns_m1_c *c, sector_t logical, u32 zone_idx,
             MAP_GRANULARITY_SECTORS;
       }
 
+   /*
+    * tombstone은 논리 삭제만 나타낸다. 실제 데이터 블록을 새로
+    * 기록하지 않으므로 목적지의 유효 sector 수를 늘리지 않는다.
+    */
    if (!tombstone)
       c->zones[zone_idx].valid_sectors += MAP_GRANULARITY_SECTORS;
 
@@ -507,6 +531,10 @@ static int initialize_zone_pool(struct zns_m1_c *c, struct block_device *bdev)
       }
    }
 
+   /*
+    * active pool 외에 최소 한 개의 빈 reserve가 있어야 한다.
+    * reserve는 공간 부족 GC에서 유효 데이터를 옮길 임시 목적지다.
+    */
    if (c->nr_free_zones < pool_size + 1)
       return -ENOSPC;
 
@@ -590,6 +618,10 @@ static void compact_runs(struct work_struct *work)
          return;
       }
 
+      /*
+       * lock 안에서 입력 run을 선택하고 compacting으로 표시한다.
+       * 표시된 run은 다른 병합에서 선택되지 않으며 읽기 검색에는 남는다.
+       */
       nr = select_compaction(c, selected, &level);
       if (!nr) {
          c->compaction_running = false;
@@ -608,6 +640,10 @@ static void compact_runs(struct work_struct *work)
       output->level = level + 1;
       INIT_LIST_HEAD(&output->list);
 
+      /*
+       * 입력 run은 불변이므로 큰 트리를 만드는 동안 lock을 놓는다.
+       * 중복 키의 최신 sequence와 tombstone을 함께 보존한다.
+       */
       for (i = 0; i < nr && !ret; i++) {
          struct rb_node *node;
 
@@ -636,6 +672,10 @@ static void compact_runs(struct work_struct *work)
          goto failed;
       }
 
+      /*
+       * 결과가 완성된 뒤 입력 목록을 결과 run으로 교체한다.
+       * 실패 경로는 입력을 그대로 두고 compacting 표시만 되돌린다.
+       */
       output->generation = generation;
       mutex_lock(&c->lock);
       for (i = 0; i < nr; i++) {
@@ -651,6 +691,10 @@ static void compact_runs(struct work_struct *work)
 
       DMINFO("compaction: L%u %u runs -> L%u (%u entries)",
              level, nr, output->level, output->nr_entries);
+      /*
+       * 매핑 병합 자체는 물리 데이터를 옮기지 않는다. 물리 GC 요청은
+       * 일반 I/O와 같은 queue로 보내 순차 쓰기 순서를 유지한다.
+       */
       if (!READ_ONCE(c->stopping))
          queue_work(c->io_wq, &c->compaction_gc_work);
       continue;
@@ -680,6 +724,10 @@ static bool zone_is_gc_candidate(struct zns_m1_c *c, u32 zone_idx,
        !zone->invalid_sectors)
       return false;
 
+   /*
+    * 비율의 분모는 zone 전체 용량이 아니라 실제 사용한 영역 wp다.
+    * 공간 부족 GC는 0을 전달하므로 이 최소 비율 제한을 받지 않는다.
+    */
    if (mul_u64_u64_div_u64(zone->invalid_sectors, 100, zone->wp) <
        min_invalid_percent)
       return false;
@@ -749,6 +797,10 @@ static int select_cost_benefit_victim(struct zns_m1_c *c, u32 *victim,
                                 min_invalid_percent))
          continue;
 
+      /*
+       * 회수 이득(invalid)과 오래 유지된 정도(age)를 반영하되,
+       * 사용량과 유효 데이터 복사 부담(wp + valid)을 비용으로 둔다.
+       */
       age = c->write_generation - zone->last_modified_generation;
       denominator = (u64)zone->wp + zone->valid_sectors;
       score = mul_u64_u64_div_u64(age, zone->invalid_sectors,
@@ -803,6 +855,10 @@ static int collect_tree_gc_moves(struct zns_m1_c *c, struct rb_root *root,
       if (entry->tombstone || entry->zone_idx != victim)
          continue;
 
+      /*
+       * 이전 버전까지 복사하면 이미 덮어쓴 데이터가 살아날 수 있다.
+       * 현재 조회 결과와 같은 항목일 때만 이동 목록에 넣는다.
+       */
       latest = map_lookup(c, entry->logical_sector);
       if (latest != entry)
          continue;
@@ -881,6 +937,10 @@ static int copy_gc_block(struct zns_m1_c *c, sector_t source,
    struct page *page;
    int ret;
 
+   /*
+    * GC용 임시 페이지 할당에서 파일시스템 I/O 재진입을 피한다.
+    * 원본 읽기가 성공한 경우에만 목적지에 같은 4 KiB를 쓴다.
+    */
    page = alloc_page(GFP_NOIO);
    if (!page)
       return -ENOMEM;
@@ -904,6 +964,10 @@ static int relocate_victim(struct zns_m1_c *c, struct dm_target *ti,
 
    *moved_sectors = 0;
    mutex_lock(&c->lock);
+   /*
+    * 이동 목록의 블록 수와 zone의 유효 sector 통계가 맞는지
+    * 검사한다. 불일치하면 reset하지 않고 오류로 중단한다.
+    */
    ret = collect_gc_moves(c, victim, &moves, &nr_moves);
    if (!ret && nr_moves * MAP_GRANULARITY_SECTORS !=
        c->zones[victim].valid_sectors)
@@ -932,6 +996,10 @@ static int relocate_victim(struct zns_m1_c *c, struct dm_target *ti,
          (sector_t)destination * c->zone_size + destination_offset;
       mutex_unlock(&c->lock);
 
+      /*
+       * 동기 하위 I/O를 기다리는 동안 메타데이터 mutex를 놓는다.
+       * 물리 복사가 끝나기 전에는 논리 매핑을 목적지로 바꾸지 않는다.
+       */
       ret = copy_gc_block(c, source, destination_sector);
       if (ret)
          goto out_free;
@@ -940,6 +1008,10 @@ static int relocate_victim(struct zns_m1_c *c, struct dm_target *ti,
       c->zones[destination].wp += MAP_GRANULARITY_SECTORS;
       c->zones[destination].last_modified_generation =
          ++c->write_generation;
+      /*
+       * 목록을 만들 때의 sequence와 위치를 재확인한다. 더 이상 같은
+       * 매핑이 아니면 복사본은 무효 처리하고 현재 매핑을 유지한다.
+       */
       latest = map_lookup(c, move->logical_sector);
       if (!latest || latest->tombstone ||
           latest->sequence != move->sequence ||
@@ -964,6 +1036,10 @@ static int relocate_victim(struct zns_m1_c *c, struct dm_target *ti,
    }
 
    mutex_lock(&c->lock);
+   /*
+    * 호출자가 victim을 reset해도 되는지 마지막으로 확인한다.
+    * 살아 있는 데이터가 남았다면 EUCLEAN을 반환한다.
+    */
    if (c->zones[victim].valid_sectors)
       ret = -EUCLEAN;
    mutex_unlock(&c->lock);
@@ -1020,6 +1096,10 @@ static int run_zone_gc(struct zns_m1_c *c, struct dm_target *ti,
    if (ret)
       goto out_error;
 
+   /*
+    * 유효 블록 이동이 모두 성공한 뒤에만 원본 zone을 reset한다.
+    * 복사 실패 시에는 원본을 지우거나 zone 역할을 교환하지 않는다.
+    */
    ret = zns_reset_zone(c,
               ti->begin + (sector_t)victim * c->zone_size,
               c->zone_size);
@@ -1107,6 +1187,10 @@ static int run_compaction_gc(struct zns_m1_c *c)
       mutex_unlock(&c->lock);
       return -ESHUTDOWN;
    }
+   /*
+    * free가 충분하면 선제 GC 복사를 생략한다. free가 줄어든 경우에만
+    * 회수 후보와 active 목적지의 잔여 공간을 확인한다.
+    */
    if (c->nr_free_zones > c->nr_active_zones) {
       mutex_unlock(&c->lock);
       return -EAGAIN;
@@ -1133,6 +1217,10 @@ static int run_compaction_gc(struct zns_m1_c *c)
    if (ret)
       goto out_error;
 
+   /*
+    * 매핑을 모두 옮긴 후 reset하고 free pool로 반환한다.
+    * 이 경로에서는 별도로 확보한 reserve zone을 소비하지 않는다.
+    */
    ret = zns_reset_zone(c,
               c->ti->begin + (sector_t)victim * c->zone_size,
               c->zone_size);
@@ -1244,6 +1332,10 @@ static int process_read(struct zns_io_work *io)
          (sector_t)e->zone_idx * c->zone_size + e->zone_offset;
    mutex_unlock(&c->lock);
 
+   /*
+    * 삭제된 주소는 과거 물리 데이터를 읽지 않는다. 상위 요청의
+    * 버퍼를 0으로 채우고 하위 장치 접근 없이 완료한다.
+    */
    if (zero) {
       zero_fill_bio(bio);
       return 0;
@@ -1267,6 +1359,10 @@ static int process_write(struct zns_io_work *io)
 
    mutex_lock(&c->lock);
    ret = prepare_active_zone(c, bio->bi_iter.bi_sector, &active_slot);
+   /*
+    * active 교체에 쓸 free가 없으면 reserve GC로 공간을 만든다.
+    * 이 함수와 GC는 io_wq에서 실행되어 wp 사용 순서가 직렬화된다.
+    */
    if (ret) {
       mutex_unlock(&c->lock);
       ret = run_zone_gc(c, io->ti, active_slot);
@@ -1290,6 +1386,10 @@ static int process_write(struct zns_io_work *io)
    if (ret)
       return ret;
 
+   /*
+    * 하위 쓰기가 성공했으므로 wp를 전진시킨다. 이후 매핑 삽입이
+    * 실패해도 이미 쓴 공간은 되돌릴 수 없어 무효 공간으로 계산한다.
+    */
    mutex_lock(&c->lock);
    az = &c->zones[zone_idx];
    az->wp += MAP_GRANULARITY_SECTORS;
@@ -1331,6 +1431,10 @@ static void process_io(struct work_struct *work)
    struct bio *bio = io->bio;
    int ret;
 
+   /*
+    * 데이터 없는 FLUSH는 정렬 검사 대상에서 제외해 여기로 전달한다.
+    * 하위 장치의 flush 완료와 RAM 매핑의 영속성은 별개다.
+    */
    if (io->is_flush) {
       ret = submit_clone_wait(io->ctx, bio, 0, false);
       complete_original_bio(bio, ret);
@@ -1485,6 +1589,10 @@ static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
     * ext4의 읽기/쓰기 bio 경계가 달라도 찾을 수 있게 큰 bio도 같은
     * 단위로 나눔.
     */
+   /*
+    * 큰 읽기/쓰기 bio를 DM 계층에서 4 KiB로 분할한다. 쓰기 때와
+    * 읽기 때 bio 경계가 달라도 같은 매핑 키를 사용하기 위한 설정이다.
+    */
    ret = dm_set_target_max_io_len(ti, MAP_GRANULARITY_SECTORS);
    if (ret) {
       ti->error = "failed to set mapping granularity";
@@ -1537,6 +1645,10 @@ static void zns_m1_dtr(struct dm_target *ti)
    mutex_lock(&c->lock);
    c->stopping = true;
    mutex_unlock(&c->lock);
+   /*
+    * compaction이 더 이상 물리 GC를 예약하지 않도록 먼저 정리하고,
+    * 그 뒤 I/O queue를 비운 다음 매핑과 장치 참조를 해제한다.
+    */
    cancel_work_sync(&c->compaction_work);
    destroy_workqueue(c->compaction_wq);
    destroy_workqueue(c->io_wq);
@@ -1589,6 +1701,10 @@ static int zns_m1_map(struct dm_target *ti, struct bio *bio)
          return DM_MAPIO_KILL;
    }
 
+   /*
+    * DM이 bio별로 마련한 저장 공간을 작업 구조체로 사용한다.
+    * SUBMITTED를 반환한 뒤 worker가 원본 bio의 완료를 책임진다.
+    */
    io = dm_per_bio_data(bio, sizeof(*io));
    INIT_WORK(&io->work, process_io);
    io->ctx = c;
