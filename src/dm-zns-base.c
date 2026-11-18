@@ -4,8 +4,9 @@
  *
  * 상위에서는 일반 블록 장치로 보이게 했음.
  * 쓰기는 active zone의 wp에 순서대로 저장하고 논리 주소와 실제 저장
- * 위치는 메모리 LSM 구조에 기록함. M2에서는 ext4가 bio를 다르게
- * 나눠 보내도 읽을 수 있도록 sector 단위로 매핑했음.
+ * 위치는 메모리 LSM 구조에 기록함. 매핑 키는 sector 주소이지만,
+ * 매핑과 데이터 I/O의 처리 단위는 4 KiB(512-byte sector 8개)임.
+ * 매핑 영속화와 재시작 복구는 구현하지 않았으므로 실험용으로 사용함.
  */
 
 #include <linux/module.h>
@@ -44,7 +45,9 @@ static unsigned int active_zone_pool_size = DEFAULT_ACTIVE_ZONE_POOL_SIZE;
 module_param(active_zone_pool_size, uint, 0444);
 MODULE_PARM_DESC(active_zone_pool_size, "Number of zones in the active write pool");
 
-/* Only proactive compaction GC uses this threshold; 0 restores baseline. */
+/*
+ * Only proactive compaction GC uses this threshold; 0 restores baseline.
+ */
 static unsigned int compaction_gc_min_invalid_percent = 20;
 module_param(compaction_gc_min_invalid_percent, uint, 0444);
 MODULE_PARM_DESC(compaction_gc_min_invalid_percent,
@@ -57,6 +60,7 @@ enum zone_role {
    ZONE_ROLE_RESERVE,
 };
 
+/* zone 내부 상대 wp와 유효/무효 sector 수를 관리한다. 주소와 용량 단위는 512 byte이다. */
 struct zone_state {
    sector_t wp;
    sector_t capacity;
@@ -66,6 +70,7 @@ struct zone_state {
    enum zone_role role;
 };
 
+/* GC가 옮길 최신 매핑의 스냅샷. 복사 후 sequence를 다시 검사한다. */
 struct gc_move {
    sector_t logical_sector;
    sector_t source_offset;
@@ -73,6 +78,10 @@ struct gc_move {
    struct list_head list;
 };
 
+/*
+ * 논리 4 KiB 블록 -> (zone, 상대 offset). sequence는 최신 버전, tombstone은 논리 삭제를
+ * 나타낸다.
+ */
 struct map_entry {
    sector_t logical_sector;
    u32 zone_idx;
@@ -92,6 +101,7 @@ struct zns_io_work {
    bool is_flush;
 };
 
+/* 회전한 Memtable 또는 병합 결과. 이름과 달리 디스크 SSTable이 아닌 메모리 RB-tree이다. */
 struct sorted_run {
    struct rb_root root;
    u32 nr_entries;
@@ -101,6 +111,7 @@ struct sorted_run {
    struct list_head list;
 };
 
+/* DM 장치별 상태. lock은 매핑/zone 정보를 보호하고 io_wq는 데이터 I/O와 물리 GC를 직렬화한다. */
 struct zns_m1_c {
    struct dm_dev *dev;
    struct dm_target *ti;
@@ -255,6 +266,10 @@ static void free_run(struct sorted_run *run)
    kfree(run);
 }
 
+/*
+ * Memtable과 모든 run을 검색해 sequence가 가장 큰 항목을 선택한다. tombstone도 최신 버전 비교에
+ * 포함한다.
+ */
 static struct map_entry *map_lookup(struct zns_m1_c *c,
                 sector_t logical_sector)
 {
@@ -306,6 +321,9 @@ static void maybe_queue_compaction(struct zns_m1_c *c)
    }
 }
 
+/*
+ * 1024개 항목이 쌓이면 기존 트리를 L0 run으로 넘기고 새 Memtable을 시작한다. 디스크 쓰기는 발생하지 않는다.
+ */
 static void rotate_memtable(struct zns_m1_c *c)
 {
    struct sorted_run *run;
@@ -333,6 +351,9 @@ static void rotate_memtable(struct zns_m1_c *c)
    maybe_queue_compaction(c);
 }
 
+/*
+ * 새 버전을 삽입한 뒤 이전 물리 블록을 무효 처리한다. 삭제는 tombstone만 기록하고 새 유효 블록을 만들지 않는다.
+ */
 static int map_insert(struct zns_m1_c *c, sector_t logical, u32 zone_idx,
             sector_t zone_offset, bool tombstone)
 {
@@ -408,6 +429,10 @@ static int replace_active_zone(struct zns_m1_c *c, u32 active_slot)
    return 0;
 }
 
+/*
+ * 논리 블록 번호의 나머지로 active slot을 고른다. 여러 zone을 사용하지만 I/O 자체는 ordered queue에서
+ * 처리한다.
+ */
 static u32 select_active_slot(struct zns_m1_c *c, sector_t logical_sector)
 {
    u64 logical_block = logical_sector / MAP_GRANULARITY_SECTORS;
@@ -415,6 +440,10 @@ static u32 select_active_slot(struct zns_m1_c *c, sector_t logical_sector)
    return do_div(logical_block, c->nr_active_zones);
 }
 
+/*
+ * 선택한 active zone이 차면 free zone으로 교체한다. free가 없으면 호출자가 reserve를 이용한 GC를
+ * 수행한다.
+ */
 static int prepare_active_zone(struct zns_m1_c *c, sector_t logical_sector,
                   u32 *active_slot)
 {
@@ -448,6 +477,10 @@ static int fill_zone_cb(struct blk_zone *zone, unsigned int idx, void *data)
    return 0;
 }
 
+/*
+ * 빈 zone을 active pool, GC용 reserve 1개, 나머지 free pool로 나눈다. 장치의 open/active
+ * 제한도 고려한다.
+ */
 static int initialize_zone_pool(struct zns_m1_c *c, struct block_device *bdev)
 {
    unsigned int pool_size = active_zone_pool_size;
@@ -492,6 +525,7 @@ static int initialize_zone_pool(struct zns_m1_c *c, struct block_device *bdev)
    return 0;
 }
 
+/* 같은 레벨에서 오래된 run 4개를 선택하고 병합 중으로 표시해 중복 선택을 막는다. */
 static int select_compaction(struct zns_m1_c *c,
               struct sorted_run **selected, u32 *level)
 {
@@ -531,6 +565,10 @@ static void unmark_compaction(struct sorted_run **selected, unsigned int nr)
       selected[i]->compacting = false;
 }
 
+/*
+ * 선택한 불변 run들을 다음 레벨로 병합한다. 중복 키는 큰 sequence를 남기고 입력 선택과 결과 공개 구간에서 lock을
+ * 잡는다.
+ */
 static void compact_runs(struct work_struct *work)
 {
    struct zns_m1_c *c = container_of(work, struct zns_m1_c,
@@ -632,6 +670,7 @@ static const char *gc_policy_name(enum gc_policy_type policy)
    return policy == GC_POLICY_COST_BENEFIT ? "cost-benefit" : "greedy";
 }
 
+/* 닫힌 zone 중 무효 데이터가 있고 목적지에 유효 데이터를 모두 옮길 수 있는 후보만 허용한다. */
 static bool zone_is_gc_candidate(struct zns_m1_c *c, u32 zone_idx,
                   u64 max_valid_sectors, unsigned int min_invalid_percent)
 {
@@ -648,6 +687,7 @@ static bool zone_is_gc_candidate(struct zns_m1_c *c, u32 zone_idx,
    return zone->valid_sectors <= max_valid_sectors;
 }
 
+/* greedy는 사용 영역(wp) 대비 무효 sector 비율이 가장 높은 zone을 선택한다. */
 static int select_greedy_victim(struct zns_m1_c *c, u32 *victim,
                  u64 *victim_age, u64 *victim_score,
                  u64 max_valid_sectors, unsigned int min_invalid_percent)
@@ -684,6 +724,10 @@ static int select_greedy_victim(struct zns_m1_c *c, u32 *victim,
    return found ? 0 : -ENOSPC;
 }
 
+/*
+ * cost-benefit 점수 = age * invalid / (wp + valid). age는 시간이 아닌 마지막 쓰기 이후의
+ * 쓰기 세대 차이다.
+ */
 static int select_cost_benefit_victim(struct zns_m1_c *c, u32 *victim,
                       u64 *victim_age, u64 *victim_score,
                       u64 max_valid_sectors, unsigned int min_invalid_percent)
@@ -744,6 +788,7 @@ static int select_gc_victim(struct zns_m1_c *c, u32 *victim,
                     max_valid_sectors, min_invalid_percent);
 }
 
+/* 과거 버전과 tombstone을 제외하고 victim을 가리키는 최신 매핑만 이동 목록에 넣는다. */
 static int collect_tree_gc_moves(struct zns_m1_c *c, struct rb_root *root,
                   u32 victim, struct list_head *moves,
                   u64 *nr_moves)
@@ -829,6 +874,7 @@ static int submit_page_wait(struct zns_m1_c *c, struct page *page,
    return ret;
 }
 
+/* 유효 데이터 한 블록을 동기 READ 후 동기 WRITE로 복사한다. 현재 GC는 4 KiB씩 순차 처리한다. */
 static int copy_gc_block(struct zns_m1_c *c, sector_t source,
              sector_t destination)
 {
@@ -847,6 +893,7 @@ static int copy_gc_block(struct zns_m1_c *c, sector_t source,
    return ret;
 }
 
+/* 물리 복사가 성공한 뒤 최신 매핑을 목적지로 바꾼다. victim의 유효 데이터가 모두 사라졌는지도 확인한다. */
 static int relocate_victim(struct zns_m1_c *c, struct dm_target *ti,
               u32 victim, u32 destination, u64 *moved_sectors)
 {
@@ -926,6 +973,10 @@ out_free:
    return ret;
 }
 
+/*
+ * 공간 부족 시 reserve로 유효 데이터를 옮긴다. reset한 victim은 새 reserve, 기존 reserve는
+ * active가 된다.
+ */
 static int run_zone_gc(struct zns_m1_c *c, struct dm_target *ti,
              u32 active_slot)
 {
@@ -1002,6 +1053,9 @@ out_error:
    return ret;
 }
 
+/*
+ * 남은 공간이 가장 큰 active zone을 목적지로 고른다. 선제 GC에만 최소 무효 비율(기본 20%)을 적용한다.
+ */
 static int select_compaction_gc_target(struct zns_m1_c *c, u32 *victim,
                        u32 *destination, u64 *victim_age,
                        u64 *victim_score)
@@ -1034,6 +1088,10 @@ static int select_compaction_gc_target(struct zns_m1_c *c, u32 *victim,
    return 0;
 }
 
+/*
+ * free zone 수가 active 수 이하일 때 선제 회수를 시도한다. 복사와 reset이 성공한 victim을 free
+ * pool에 반환한다.
+ */
 static int run_compaction_gc(struct zns_m1_c *c)
 {
    u64 moved_sectors = 0;
@@ -1107,6 +1165,7 @@ out_error:
    return ret;
 }
 
+/* 메타데이터 병합 후 요청한 물리 GC는 io_wq에서 실행한다. 후보나 공간이 없으면 이번 회수는 건너뛴다. */
 static void compaction_gc_workfn(struct work_struct *work)
 {
    struct zns_m1_c *c = container_of(work, struct zns_m1_c,
@@ -1167,6 +1226,7 @@ static void complete_original_bio(struct bio *bio, int ret)
    bio_endio(bio);
 }
 
+/* 최신 매핑을 물리 주소로 변환한다. 아직 쓰지 않았거나 삭제한 논리 블록은 0으로 반환한다. */
 static int process_read(struct zns_io_work *io)
 {
    struct zns_m1_c *c = io->ctx;
@@ -1192,6 +1252,9 @@ static int process_read(struct zns_io_work *io)
    return submit_clone_wait(c, bio, physical, true);
 }
 
+/*
+ * active zone의 wp에 기록하고 하위 쓰기 완료 후 wp와 LSM 매핑을 갱신한다. 기존 위치에 덮어쓰지 않는다.
+ */
 static int process_write(struct zns_io_work *io)
 {
    struct zns_m1_c *c = io->ctx;
@@ -1239,6 +1302,7 @@ static int process_write(struct zns_io_work *io)
    return ret;
 }
 
+/* 상위 DISCARD는 논리 삭제로 처리한다. zone reset은 유효 데이터를 옮긴 GC 경로에서만 수행한다. */
 static int process_discard(struct zns_io_work *io)
 {
    struct zns_m1_c *c = io->ctx;
@@ -1257,6 +1321,10 @@ static int process_discard(struct zns_io_work *io)
    return ret;
 }
 
+/*
+ * ordered worker에서 연산을 분기하고 결과를 원본 bio에 전달한다. FLUSH 전달만으로 메모리 매핑이 영속화되지는
+ * 않는다.
+ */
 static void process_io(struct work_struct *work)
 {
    struct zns_io_work *io = container_of(work, struct zns_io_work, work);
@@ -1289,6 +1357,10 @@ static void process_io(struct work_struct *work)
    complete_original_bio(bio, ret);
 }
 
+/*
+ * dmsetup create 시 하위 장치, zone pool, 매핑과 workqueue를 준비한다. 실패하면 생성한 자원을
+ * 역순으로 해제한다.
+ */
 static int zns_m1_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
    struct zns_m1_c *c;
@@ -1453,6 +1525,9 @@ err_free:
    return ret;
 }
 
+/*
+ * 새 compaction을 막고 worker를 정리한 뒤 메모리 매핑을 해제한다. 제거 후 같은 매핑을 복원할 수 없다.
+ */
 static void zns_m1_dtr(struct dm_target *ti)
 {
    struct zns_m1_c *c = ti->private;
@@ -1489,6 +1564,7 @@ static void zns_m1_dtr(struct dm_target *ti)
    DMINFO("dtr: target detached");
 }
 
+/* DM 진입점은 정렬을 검사하고 작업을 예약한다. 잠들 수 있는 하위 I/O는 여기서 수행하지 않는다. */
 static int zns_m1_map(struct dm_target *ti, struct bio *bio)
 {
    struct zns_m1_c *c = ti->private;
@@ -1523,6 +1599,7 @@ static int zns_m1_map(struct dm_target *ti, struct bio *bio)
    return DM_MAPIO_SUBMITTED;
 }
 
+/* 상위 파일시스템에 4 KiB 단위와 논리 DISCARD/WRITE_ZEROES 지원을 알린다. */
 static void zns_m1_io_hints(struct dm_target *ti,
              struct queue_limits *limits)
 {
@@ -1540,6 +1617,9 @@ static void zns_m1_io_hints(struct dm_target *ti,
    limits->max_write_zeroes_sectors = MAP_GRANULARITY_SECTORS;
 }
 
+/*
+ * 하위 zoned queue 특성을 그대로 합성하지 않아 상위에 일반 블록 장치로 노출한다. 하위 I/O는 자체 경로로 제출한다.
+ */
 static int zns_m1_iterate_devices(struct dm_target *ti,
               iterate_devices_callout_fn fn, void *data)
 {
